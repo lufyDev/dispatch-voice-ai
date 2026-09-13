@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node scripts/test-mulaw.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
