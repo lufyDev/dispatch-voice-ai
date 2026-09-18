@@ -6,8 +6,43 @@ import { WebSocketServer } from 'ws';
 import { TwilioTransport } from './transport/twilio.js';
 import { BrowserTransport } from './transport/browser.js';
 import { attachEcho } from './pipeline/echo.js';
+import { attachTranscribe } from './pipeline/transcribe.js';
+import { DeepgramASR } from './asr/deepgram.js';
 
 const PORT = process.env.PORT || 3000;
+const PIPELINE = process.env.PIPELINE || 'transcribe'; // 'echo' | 'transcribe'
+
+// Words a home-services caller says that an 8kHz phone line mangles. Telling
+// the model to expect them is the cheapest accuracy win available.
+const HVAC_TERMS = [
+  'HVAC', 'furnace', 'condenser', 'compressor', 'thermostat', 'refrigerant',
+  'ductwork', 'heat pump', 'boiler', 'radiator', 'water heater', 'AC unit',
+  'circuit breaker', 'pilot light', 'coolant leak', 'clogged drain',
+  'sump pump', 'garbage disposal', 'burst pipe', 'no hot water',
+];
+
+/** One pipeline per call. Echo needs no API key; transcribe does. */
+function attachPipeline(transport, label) {
+  if (PIPELINE === 'echo') {
+    attachEcho(transport, { label });
+    return;
+  }
+  if (!process.env.DEEPGRAM_API_KEY) {
+    console.error('[boot] DEEPGRAM_API_KEY missing — set it, or run PIPELINE=echo');
+    transport.close();
+    return;
+  }
+  attachTranscribe(
+    transport,
+    ({ sampleRate }) => new DeepgramASR({
+      apiKey: process.env.DEEPGRAM_API_KEY,
+      model: process.env.DEEPGRAM_MODEL || 'nova-3',
+      sampleRate,
+      keyterms: HVAC_TERMS,
+    }),
+    { label }
+  );
+}
 
 const app = express();
 
@@ -90,13 +125,13 @@ server.on('upgrade', (req, socket, head) => {
 // Both lines hand the SAME pipeline two different transports. That reuse is the
 // only real evidence the Transport interface is worth anything.
 twilioWss.on('connection', (socket) => {
-  attachEcho(new TwilioTransport(socket), { label: 'twilio' });
+  attachPipeline(new TwilioTransport(socket), 'twilio');
 });
 
 browserWss.on('connection', (socket) => {
-  attachEcho(new BrowserTransport(socket), { label: 'browser' });
+  attachPipeline(new BrowserTransport(socket), 'browser');
 });
 
 server.listen(PORT, () => {
-  console.log(`[boot] http://localhost:${PORT}  ws://localhost:${PORT}/media`);
+  console.log(`[boot] http://localhost:${PORT}  pipeline=${PIPELINE}`);
 });
