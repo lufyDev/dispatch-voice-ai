@@ -7,10 +7,14 @@ import { TwilioTransport } from './transport/twilio.js';
 import { BrowserTransport } from './transport/browser.js';
 import { attachEcho } from './pipeline/echo.js';
 import { attachTranscribe } from './pipeline/transcribe.js';
+import { attachConverse } from './pipeline/converse.js';
 import { DeepgramASR } from './asr/deepgram.js';
+import { OpenAILLM } from './llm/openai.js';
+import { ElevenLabsTTS } from './tts/elevenlabs.js';
+import { DISPATCHER_PROMPT } from './prompts/dispatcher.js';
 
 const PORT = process.env.PORT || 3000;
-const PIPELINE = process.env.PIPELINE || 'transcribe'; // 'echo' | 'transcribe'
+const PIPELINE = process.env.PIPELINE || 'converse'; // 'echo' | 'transcribe' | 'converse'
 
 // Words a home-services caller says that an 8kHz phone line mangles. Telling
 // the model to expect them is the cheapest accuracy win available.
@@ -21,30 +25,57 @@ const HVAC_TERMS = [
   'sump pump', 'garbage disposal', 'burst pipe', 'no hot water',
 ];
 
-/** One pipeline per call. Echo needs no API key; transcribe does. */
+const createAsr = ({ sampleRate }) => new DeepgramASR({
+  apiKey: process.env.DEEPGRAM_API_KEY,
+  model: process.env.DEEPGRAM_MODEL || 'nova-3',
+  sampleRate,
+  keyterms: HVAC_TERMS,
+  endpointing: Number(process.env.DG_ENDPOINTING ?? 300),
+  utteranceEndMs: Number(process.env.DG_UTTERANCE_END_MS ?? 1000),
+  smartFormat: (process.env.DG_SMART_FORMAT ?? 'true') !== 'false',
+});
+
+/** Fail at connect time with a useful message, not mid-call with a 401. */
+function missingKeys(needed) {
+  return needed.filter((k) => !process.env[k]);
+}
+
+/** One pipeline per call. */
 function attachPipeline(transport, label) {
   if (PIPELINE === 'echo') {
     attachEcho(transport, { label });
     return;
   }
-  if (!process.env.DEEPGRAM_API_KEY) {
-    console.error('[boot] DEEPGRAM_API_KEY missing — set it, or run PIPELINE=echo');
+
+  const needed = PIPELINE === 'converse'
+    ? ['DEEPGRAM_API_KEY', 'OPENAI_API_KEY', 'ELEVENLABS_API_KEY']
+    : ['DEEPGRAM_API_KEY'];
+  const missing = missingKeys(needed);
+  if (missing.length) {
+    console.error(`[boot] missing ${missing.join(', ')} — set them, or run PIPELINE=echo`);
     transport.close();
     return;
   }
-  attachTranscribe(
-    transport,
-    ({ sampleRate }) => new DeepgramASR({
-      apiKey: process.env.DEEPGRAM_API_KEY,
-      model: process.env.DEEPGRAM_MODEL || 'nova-3',
-      sampleRate,
-      keyterms: HVAC_TERMS,
-      endpointing: Number(process.env.DG_ENDPOINTING ?? 300),
-      utteranceEndMs: Number(process.env.DG_UTTERANCE_END_MS ?? 1000),
-      smartFormat: (process.env.DG_SMART_FORMAT ?? 'true') !== 'false',
+
+  if (PIPELINE === 'transcribe') {
+    attachTranscribe(transport, createAsr, { label });
+    return;
+  }
+
+  attachConverse(transport, {
+    createAsr,
+    llm: new OpenAILLM({
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
     }),
-    { label }
-  );
+    tts: new ElevenLabsTTS({
+      apiKey: process.env.ELEVENLABS_API_KEY,
+      voiceId: process.env.ELEVENLABS_VOICE_ID,
+      model: process.env.ELEVENLABS_MODEL,
+    }),
+    systemPrompt: DISPATCHER_PROMPT,
+    label,
+  });
 }
 
 const app = express();
