@@ -23,7 +23,17 @@ export class DeepgramASR extends ASR {
   #open = false;
   #queued = [];
 
-  constructor({ apiKey, sampleRate = 8000, model = 'nova-3', keyterms = [] }) {
+  constructor({
+    apiKey,
+    sampleRate = 8000,
+    model = 'nova-3',
+    keyterms = [],
+    // Latency knobs, settable from env so we can sweep them and measure rather
+    // than guess. These two are the biggest single cost in the whole budget.
+    endpointing = 300,
+    utteranceEndMs = 1000,
+    smartFormat = true,
+  }) {
     super();
 
     const params = new URLSearchParams({
@@ -35,15 +45,15 @@ export class DeepgramASR extends ASR {
       interim_results: 'true',
       // Silence (ms) before Deepgram freezes a chunk as final. Lower = snappier
       // finals, more mid-sentence splits. This is a latency knob we will tune.
-      endpointing: '300',
+      endpointing: String(endpointing),
       // Silence (ms) before Deepgram declares the whole TURN over. This is the
       // signal we reply on -- deliberately longer than endpointing.
-      utterance_end_ms: '1000',
+      utterance_end_ms: String(utteranceEndMs),
       // Emit SpeechStarted, so we can detect barge-in without our own VAD yet.
       vad_events: 'true',
       // Punctuation and number/date formatting. Costs a little latency on
       // finals, but "four one five" vs "415" matters a lot for addresses.
-      smart_format: 'true',
+      smart_format: String(smartFormat),
     });
 
     // Domain vocabulary. Phone audio is 8kHz and mangles consonants, so telling
@@ -93,6 +103,12 @@ export class DeepgramASR extends ASR {
           confidence: alt.confidence,
         };
         this.emit(msg.is_final ? 'final' : 'interim', payload);
+
+        // speech_final: endpointing believes the speaker stopped. This is the
+        // OTHER turn signal, and the useful one -- it is driven by `endpointing`,
+        // which has no floor, unlike utterance_end_ms which Deepgram refuses
+        // below 1000ms. Prefer this for replying.
+        if (msg.speech_final) this.emit('speechFinal', payload);
         break;
       }
 

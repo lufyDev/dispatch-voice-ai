@@ -60,11 +60,18 @@ export function attachTranscribe(transport, createAsr, { label = 'call' } = {}) 
       );
     });
 
+    asr.on('speechFinal', ({ endMs }) => {
+      // Endpointing-driven turn end. Tunable all the way down, unlike
+      // utteranceEnd, so this is what M4 will actually reply on.
+      const lag = lagFrom(endMs);
+      if (lag !== null) lags.push(lag);
+      console.log(`[${label}] SPEECH FINAL (+${lag?.toFixed(0)}ms after last word)`);
+    });
+
     asr.on('utteranceEnd', ({ lastWordEndMs }) => {
       // THE number for M2: speech-end -> we know the turn is over.
       const lag = lagFrom(lastWordEndMs);
-      if (lag !== null) lags.push(lag);
-      console.log(`[${label}] TURN END (+${lag?.toFixed(0)}ms after last word) — would reply now`);
+      console.log(`[${label}] utteranceEnd (+${lag?.toFixed(0)}ms after last word)`);
     });
   });
 

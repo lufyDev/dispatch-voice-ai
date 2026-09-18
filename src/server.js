@@ -39,6 +39,9 @@ function attachPipeline(transport, label) {
       model: process.env.DEEPGRAM_MODEL || 'nova-3',
       sampleRate,
       keyterms: HVAC_TERMS,
+      endpointing: Number(process.env.DG_ENDPOINTING ?? 300),
+      utteranceEndMs: Number(process.env.DG_UTTERANCE_END_MS ?? 1000),
+      smartFormat: (process.env.DG_SMART_FORMAT ?? 'true') !== 'false',
     }),
     { label }
   );
