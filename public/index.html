@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dispatch — browser transport</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-200 font-mono text-sm min-h-screen p-8">
+  <div class="max-w-2xl mx-auto space-y-6">
+    <header>
+      <h1 class="text-xl text-slate-100">Dispatch · BrowserTransport</h1>
+      <p class="text-slate-400 mt-1">
+        Mic → 48kHz float → FIR low-pass 3400Hz → decimate 6:1 → PCM16 8kHz → WebSocket
+      </p>
+    </header>
+
+    <button id="toggle"
+      class="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-40">
+      Start mic
+    </button>
+
+    <dl class="grid grid-cols-2 gap-x-6 gap-y-2">
+      <dt class="text-slate-400">status</dt><dd id="status">idle</dd>
+      <dt class="text-slate-400">context rate</dt><dd id="rate">—</dd>
+      <dt class="text-slate-400">frames sent</dt><dd id="sent">0</dd>
+      <dt class="text-slate-400">frames echoed back</dt><dd id="recv">0</dd>
+      <dt class="text-slate-400">playback queue</dt><dd id="queue">0 frames</dd>
+      <dt class="text-slate-400">clears honoured</dt><dd id="cleared">0</dd>
+      <dt class="text-slate-400">input level</dt>
+      <dd><div class="h-3 w-48 bg-slate-800 rounded overflow-hidden">
+        <div id="level" class="h-full w-0 bg-emerald-500 transition-[width] duration-75"></div>
+      </div></dd>
+    </dl>
+
+    <pre id="log" class="bg-slate-900 rounded p-3 h-56 overflow-y-auto text-xs text-slate-400"></pre>
+  </div>
+
+<script type="module">
+import { lowpassTaps } from './dsp.js';
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => {
+  $('log').textContent += `${new Date().toISOString().slice(11, 23)}  ${m}\n`;
+  $('log').scrollTop = $('log').scrollHeight;
+};
+
+const TARGET_RATE = 8000;
+const CONTEXT_RATE = 48000; // pinned so 48000/8000 is an integer 6
+
+let ctx = null;
+let ws = null;
+let stream = null;
+let sent = 0;
+let recv = 0;
+
+// ---------------------------------------------------------------------------
+// PLAYBACK
+//
+// Frames do not arrive perfectly evenly, so scheduling each one to play the
+// instant it lands means a late frame leaves a gap -- an audible click. We run
+// playback deliberately BEHIND arrival by JITTER_MS.
+//
+// That delay is a latency decision, not a constant: it is added directly to
+// voice-to-voice latency and spent out of the 800ms budget. Too small, clicks;
+// too large, sluggish.
+const JITTER_MS = 60;
+
+let playhead = 0;          // ctx.currentTime at which the next frame should start
+let scheduled = [];        // live sources, so clear() can stop them
+let clears = 0;
+
+function enqueue(pcm) {
+  // An AudioBuffer declared at 8000Hz inside a 48000Hz context: the browser
+  // upsamples on playback. We let it, because this is output -- nothing
+  // downstream analyses it, unlike the capture path where we filtered by hand.
+  const buf = ctx.createBuffer(1, pcm.length, 8000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i += 1) ch[i] = pcm[i] / 32768;
+
+  // If we have fallen behind real time, the queue drained: restart ahead of now
+  // rather than scheduling in the past (which plays everything at once).
+  const now = ctx.currentTime;
+  if (playhead < now) playhead = now + JITTER_MS / 1000;
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.start(playhead);
+  playhead += buf.duration;
+
+  scheduled.push(src);
+  src.onended = () => {
+    scheduled = scheduled.filter((s) => s !== src);
+    $('queue').textContent = `${scheduled.length} frames`;
+  };
+  $('queue').textContent = `${scheduled.length} frames`;
+}
+
+/**
+ * Barge-in. For Twilio the playback queue lives in THEIR infrastructure and
+ * clear is a message we send them; here the queue is our own scheduled source
+ * nodes, so clear means stopping each one. Opposite side of the wire, identical
+ * contract -- which is the thing a single-implementation interface would have
+ * failed to notice.
+ */
+function doClear() {
+  for (const src of scheduled) {
+    src.cancelled = true;   // onended fires on stop() too; a dropped mark must
+    try { src.stop(); } catch { /* already finished */ }  // not claim it played
+  }
+  scheduled = [];
+  playhead = 0;
+  clears += 1;
+  $('cleared').textContent = clears;
+  $('queue').textContent = '0 frames';
+  log(`clear: dropped queued audio`);
+}
+
+/**
+ * A bookmark in the playback queue: one sample of silence scheduled at the
+ * current playhead. When playback reaches it, onended fires and we tell the
+ * server. This is the only way the server learns what was actually HEARD rather
+ * than merely sent.
+ */
+function scheduleMark(name) {
+  const src = ctx.createBufferSource();
+  src.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+  src.connect(ctx.destination);
+  src.onended = () => {
+    if (src.cancelled) return;  // cleared before it played: never happened
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'mark', name }));
+    log(`mark reached: ${name}`);
+  };
+  src.start(Math.max(playhead, ctx.currentTime));
+  scheduled.push(src);
+}
+
+async function start() {
+  $('toggle').disabled = true;
+  $('status').textContent = 'requesting mic…';
+
+  // Every one of these OFF. They are designed to make human speech sound nice
+  // on a video call, and they mangle the signal a VAD and an ASR need to see.
+  // Echo cancellation in particular will attack our own echoed audio.
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  });
+
+  ctx = new AudioContext({ sampleRate: CONTEXT_RATE });
+  $('rate').textContent = `${ctx.sampleRate} Hz`;
+  if (ctx.sampleRate !== CONTEXT_RATE) {
+    log(`WARNING: browser refused ${CONTEXT_RATE}Hz and gave ${ctx.sampleRate}Hz.`);
+    log(`decimation factor ${ctx.sampleRate / TARGET_RATE} is not an integer — audio will be wrong.`);
+  }
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/browser`);
+  ws.binaryType = 'arraybuffer';
+  await new Promise((ok, err) => { ws.onopen = ok; ws.onerror = err; });
+  ws.send(JSON.stringify({ type: 'start', callId: 'browser-' + Date.now() }));
+  log('websocket open, sent start');
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'clear') doClear();
+      else if (msg.type === 'mark') scheduleMark(msg.name);
+      else log(`unhandled control: ${ev.data}`);
+      return;
+    }
+    recv += 1;
+    $('recv').textContent = recv;
+    enqueue(new Int16Array(ev.data));
+  };
+  ws.onclose = () => { log('websocket closed'); stop(); };
+
+  await ctx.audioWorklet.addModule('/capture-worklet.js');
+  const node = new AudioWorkletNode(ctx, 'capture', {
+    processorOptions: {
+      inputRate: ctx.sampleRate,
+      targetRate: TARGET_RATE,
+      taps: lowpassTaps(3400, ctx.sampleRate),
+    },
+  });
+
+  node.port.onmessage = (ev) => {
+    const pcm = new Int16Array(ev.data);
+    if (ws.readyState === WebSocket.OPEN) ws.send(pcm.buffer);
+    sent += 1;
+    $('sent').textContent = sent;
+
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i += 1) sum += pcm[i] * pcm[i];
+    const rms = Math.sqrt(sum / pcm.length) / 32768;
+    $('level').style.width = `${Math.min(100, rms * 400).toFixed(0)}%`;
+  };
+
+  // The worklet must be connected to something for the graph to pull audio, but
+  // we do NOT want the raw mic in the speakers — that is a feedback loop. A
+  // zero-gain sink keeps the graph running and the room quiet.
+  const sink = new GainNode(ctx, { gain: 0 });
+  ctx.createMediaStreamSource(stream).connect(node).connect(sink).connect(ctx.destination);
+
+  $('status').textContent = 'capturing';
+  $('toggle').textContent = 'Stop mic';
+  $('toggle').disabled = false;
+  log(`capturing: ${ctx.sampleRate}Hz -> ${TARGET_RATE}Hz, 49-tap FIR @3400Hz, /${ctx.sampleRate / TARGET_RATE}`);
+}
+
+function stop() {
+  stream?.getTracks().forEach((t) => t.stop());
+  ctx?.close();
+  if (ws?.readyState === WebSocket.OPEN) ws.close();
+  ctx = null; ws = null; stream = null;
+  scheduled = []; playhead = 0;
+  $('queue').textContent = '0 frames';
+  $('status').textContent = 'idle';
+  $('level').style.width = '0%';
+  $('toggle').textContent = 'Start mic';
+  $('toggle').disabled = false;
+}
+
+$('toggle').onclick = () => (ctx ? stop() : start().catch((e) => {
+  log(`error: ${e.message}`);
+  $('status').textContent = 'error';
+  $('toggle').disabled = false;
+}));
+</script>
+</body>
+</html>

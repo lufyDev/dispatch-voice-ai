@@ -4,6 +4,7 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 
 import { TwilioTransport } from './transport/twilio.js';
+import { BrowserTransport } from './transport/browser.js';
 import { attachEcho } from './pipeline/echo.js';
 
 const PORT = process.env.PORT || 3000;
@@ -12,6 +13,9 @@ const app = express();
 
 // Twilio posts webhooks as application/x-www-form-urlencoded, not JSON.
 app.use(express.urlencoded({ extended: false }));
+
+// The browser dev client.
+app.use(express.static('public'));
 
 /**
  * Where Twilio should open the media-stream WebSocket.
@@ -52,15 +56,45 @@ app.all('/voice', (req, res) => {
   );
 });
 
-// Express and the WebSocket share one HTTP server, and therefore one port --
-// we only get one ngrok tunnel, so /voice and /media must live together.
+// Express and the WebSockets share one HTTP server, and therefore one port --
+// we only get one ngrok tunnel, so /voice, /media and /browser must live
+// together.
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/media' });
 
-wss.on('connection', (socket) => {
-  // One transport per call. Nothing about a call may live in module scope, or a
-  // second simultaneous caller corrupts the first.
+// noServer, and we route the upgrade ourselves. NOT two
+// `new WebSocketServer({ server, path })` instances: each of those registers its
+// own 'upgrade' listener, and whichever fires first checks the path, doesn't
+// match, and aborts the socket with a 400 before the other one is ever consulted.
+// The second endpoint then looks like it simply doesn't exist.
+//
+// This is also the dispatch that `{ server, path }` was hiding from us.
+const twilioWss = new WebSocketServer({ noServer: true });
+const browserWss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+  const target = pathname === '/media' ? twilioWss
+    : pathname === '/browser' ? browserWss
+    : null;
+
+  if (!target) {
+    socket.destroy();
+    return;
+  }
+  target.handleUpgrade(req, socket, head, (ws) => target.emit('connection', ws, req));
+});
+
+// One transport per call. Nothing about a call may live in module scope, or a
+// second simultaneous caller corrupts the first.
+//
+// Both lines hand the SAME pipeline two different transports. That reuse is the
+// only real evidence the Transport interface is worth anything.
+twilioWss.on('connection', (socket) => {
   attachEcho(new TwilioTransport(socket), { label: 'twilio' });
+});
+
+browserWss.on('connection', (socket) => {
+  attachEcho(new BrowserTransport(socket), { label: 'browser' });
 });
 
 server.listen(PORT, () => {
