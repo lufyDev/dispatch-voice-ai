@@ -32,6 +32,15 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   let pendingFinals = [];
   let turnBusy = false;
   let audioZeroWall = null;
+
+  // True from the first byte of agent audio until playback ACTUALLY finishes.
+  // While set, mic audio is not fed to the ASR at all -- otherwise the agent
+  // hears itself through the caller's speaker, transcribes its own words, and
+  // submits them as the next user turn. (Headphones hide this in dev; a caller
+  // on speakerphone does not.)
+  let speaking = false;
+  let markSeq = 0;
+  let awaitingMark = null;
   const turnLags = [];
 
   async function runTurn(userText, lastWordWall) {
@@ -57,6 +66,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
         if (!next) { await new Promise((r) => setTimeout(r, 5)); continue; }
         for await (const pcm of tts.speak(next, { signal: ac.signal })) {
           if (t.ttsFirstByte === undefined) t.ttsFirstByte = performance.now();
+          speaking = true;
           transport.send(pcm);
           if (t.firstAudioOut === undefined) t.firstAudioOut = performance.now();
         }
@@ -89,6 +99,25 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     queueDone = true;
     await worker;
 
+    // Bookmark behind the last audio chunk. `speaking` stays true until the
+    // transport tells us playback reached it.
+    if (t.firstAudioOut !== undefined) {
+      awaitingMark = `turn-${++markSeq}`;
+      transport.mark(awaitingMark);
+      // A transport whose far end never reports the mark (dropped call, a
+      // transport that does not implement marks) must not wedge the mic shut.
+      const stuck = awaitingMark;
+      setTimeout(() => {
+        if (awaitingMark !== stuck) return;
+        console.log(`[${label}] mark ${stuck} never returned — reopening mic`);
+        awaitingMark = null;
+        speaking = false;
+        pendingFinals = [];
+      }, 15000);
+    } else {
+      speaking = false;
+    }
+
     history.push({ role: 'assistant', content: reply.trim() });
     console.log(`[${label}] AGENT: "${reply.trim()}"`);
 
@@ -107,6 +136,22 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     asr = createAsr({ sampleRate });
 
     asr.on('error', (err) => console.error(`[${label}] asr error: ${err.message}`));
+
+    // Playback reached our bookmark, so the caller has now HEARD everything we
+    // sent. This is the only correct moment to reopen the mic: "finished
+    // sending" is 3+ seconds earlier, because generating a reply is much faster
+    // than speaking it.
+    transport.on('mark', (name) => {
+      if (name !== awaitingMark) return;
+      awaitingMark = null;
+      speaking = false;
+      // Anything captured while we were talking is our own voice or the caller
+      // talking over us. We cannot use either yet -- handling the second case
+      // properly is barge-in, which is M4.
+      const discarded = pendingFinals.join(' ').trim();
+      pendingFinals = [];
+      if (discarded) console.log(`[${label}] (discarded while speaking: "${discarded}")`);
+    });
     asr.on('final', ({ text }) => pendingFinals.push(text));
 
     // speech_final, not utteranceEnd: 335ms vs 1765ms. See docs/02-asr.md.
@@ -130,6 +175,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
   transport.on('frame', (frame) => {
     if (audioZeroWall === null) audioZeroWall = performance.now() - frame.timestampMs;
+    // Half-duplex: deaf while talking. Crude, and it makes interruption
+    // impossible -- M4 replaces this with a real VAD that can tell the caller's
+    // voice from our own echo and cut us off mid-sentence.
+    if (speaking) return;
     asr?.write(frame.pcm);
   });
   transport.on('error', (err) => console.error(`[${label}] transport error: ${err.message}`));
