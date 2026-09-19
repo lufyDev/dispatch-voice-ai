@@ -11,6 +11,10 @@
  *
  * Multi-turn matters: several bugs only appear on turn 2+ (ASR clock drift, the
  * agent hearing itself, history growth). One connection, many turns.
+ *
+ * INTERRUPT_MS=1200 makes each turn start 1200ms after the agent BEGINS
+ * speaking, instead of waiting politely for it to finish. That is barge-in, and
+ * there is no other way to test it.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
@@ -26,6 +30,8 @@ const RATE = 8000;
 const FRAME_BYTES = 160 * 2; // 20ms of PCM16
 const LEAD_MS = 400;         // silence before speaking, so the ASR settles
 const TAIL_MS = 1500;        // silence after, so endpointing fires
+// Talk over the agent this many ms after it starts speaking. 0 = wait politely.
+const INTERRUPT_MS = Number(process.env.INTERRUPT_MS || 0);
 
 /** `say` inserts an FLLR padding chunk, so audio does NOT start at byte 44. */
 function wavPcm(buf) {
@@ -119,12 +125,25 @@ ws.on('open', async () => {
     firstAudioAt = null;
     agentAudioMs = 0;
     await stream(render(text));
-    // Wait for the agent to finish speaking before the next turn, so we are not
-    // talking over it — the server is half-duplex until M4.
-    await new Promise((r) => {
-      markResolve = r;
-      setTimeout(() => { if (markResolve === r) { markResolve = null; r(); } }, 20000);
-    });
+    if (INTERRUPT_MS > 0) {
+      // Wait for the agent to START, then cut in. The clock keeps running
+      // throughout, so the server hears us arrive mid-sentence.
+      await new Promise((r) => {
+        const started = setInterval(() => {
+          if (firstAudioAt === null) return;
+          clearInterval(started);
+          setTimeout(r, INTERRUPT_MS);
+        }, 20);
+        setTimeout(() => { clearInterval(started); r(); }, 20000);
+      });
+      console.log(`[say] cutting in ${INTERRUPT_MS}ms after the agent started`);
+    } else {
+      // Wait for the agent to finish speaking before the next turn.
+      await new Promise((r) => {
+        markResolve = r;
+        setTimeout(() => { if (markResolve === r) { markResolve = null; r(); } }, 20000);
+      });
+    }
   }
 
   running = false;

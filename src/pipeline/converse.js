@@ -43,6 +43,39 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   let speaking = false;
   let markSeq = 0;
   let awaitingMark = null;
+
+  // The in-flight turn's abort handle, hoisted so barge-in can reach it.
+  let turnAbort = null;
+  const bargeIns = [];
+
+  /**
+   * The caller started talking while we were. Five things must happen, and the
+   * ORDER matters more than it looks.
+   *
+   * clear() goes FIRST. Whatever is queued at the far end is what the caller is
+   * hearing right now, and every millisecond spent tidying up our own generators
+   * is another millisecond of being talked over. Cancelling the LLM first would
+   * be politer to our bill and ruder to the human.
+   */
+  function bargeIn(atMs) {
+    const t0 = performance.now();
+
+    transport.clear();          // 1. stop what they are hearing, immediately
+    turnAbort?.abort();         // 2 & 3. stop generating text and audio
+    turnAbort = null;
+
+    speaking = false;           // 4. start listening again
+    awaitingMark = null;        // the mark we were waiting on will never arrive
+    // Anything the ASR captured while we spoke is our own voice, or a fragment
+    // of the interruption we are about to hear properly.
+    pendingFinals = [];
+
+    // 5. Truncating history to what the caller actually HEARD is diff 4c. Right
+    //    now the agent still believes it said the whole sentence.
+    const took = performance.now() - t0;
+    bargeIns.push(took);
+    console.log(`[${label}] BARGE-IN at audio ${atMs}ms — cleared + aborted in ${took.toFixed(1)}ms`);
+  }
   const turnLags = [];
 
   async function runTurn(userText, lastWordWall) {
@@ -53,9 +86,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     history.push({ role: 'user', content: userText });
     console.log(`[${label}] USER: "${userText}"`);
 
-    // Held per-turn so M4 can abort the LLM and TTS on barge-in instead of
-    // paying for audio nobody will hear.
+    // Held per-turn so barge-in can abort the LLM and TTS instead of paying for
+    // audio nobody will hear.
     const ac = new AbortController();
+    turnAbort = ac;
 
     const sentences = [];
     let queueDone = false;
@@ -64,6 +98,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // Drains sentences in order. Started as soon as the FIRST sentence exists.
     async function drain() {
       while (sentences.length || !queueDone) {
+        if (ac.signal.aborted) return;
         const next = sentences.shift();
         if (!next) { await new Promise((r) => setTimeout(r, 5)); continue; }
         for await (const pcm of tts.speak(next, { signal: ac.signal })) {
@@ -100,6 +135,8 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     }
     queueDone = true;
     await worker;
+
+    if (ac.signal.aborted) return; // interrupted: no mark, no trace, no history
 
     // Bookmark behind the last audio chunk. `speaking` stays true until the
     // transport tells us playback reached it.
@@ -142,7 +179,13 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // barge-in needs. Logging only for now; 4b acts on it.
     vad = new EnergyVAD({ sampleRate });
     vad.on('speechStart', ({ atMs }) => {
-      console.log(`[${label}] VAD speech start @${atMs}ms${speaking ? '  <-- WHILE AGENT SPEAKING (barge-in candidate)' : ''}`);
+      if (speaking) {
+        // Every voice counts as an interruption for now, including "mhm" and
+        // "okay" — filtering backchannels is diff 4d.
+        bargeIn(atMs);
+        return;
+      }
+      console.log(`[${label}] VAD speech start @${atMs}ms`);
     });
     vad.on('speechEnd', ({ atMs }) => console.log(`[${label}] VAD speech end @${atMs}ms`));
 
@@ -179,7 +222,12 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       }
       turnBusy = true;
       runTurn(userText, lastWordWall)
-        .catch((err) => console.error(`[${label}] turn failed: ${err.message}`))
+        .catch((err) => {
+          // An abort is barge-in working as designed, not an error. fetch()
+          // surfaces it as a DOMException named AbortError.
+          if (err?.name === 'AbortError') return;
+          console.error(`[${label}] turn failed: ${err.message}`);
+        })
         .finally(() => { turnBusy = false; });
     });
   });
@@ -207,6 +255,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
   transport.on('stop', () => {
     asr?.finish();
+    if (bargeIns.length) {
+      const sorted = [...bargeIns].sort((a, b) => a - b);
+      console.log(`[${label}] barge-ins: n=${sorted.length} p50=${sorted[Math.floor(sorted.length / 2)].toFixed(1)}ms max=${sorted.at(-1).toFixed(1)}ms`);
+    }
     if (turnLags.length) {
       const sorted = [...turnLags].sort((a, b) => a - b);
       console.log(
