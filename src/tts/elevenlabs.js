@@ -23,7 +23,10 @@ export class ElevenLabsTTS extends TTS {
   #voiceId;
   #model;
 
-  constructor({ apiKey, voiceId = '21m00Tcm4TlvDq8ikWAM', model = 'eleven_flash_v2_5' }) {
+  // Default is Sarah. NOT Rachel/Aria: those are Voice Library voices, and a
+  // free ElevenLabs account gets 402 "Free users cannot use library voices via
+  // the API" for them. Sarah/George/Jessica/Lily work on the free tier.
+  constructor({ apiKey, voiceId = 'EXAVITQu4vr4xnSDxMaL', model = 'eleven_flash_v2_5' }) {
     super();
     this.#apiKey = apiKey;
     this.#voiceId = voiceId;
