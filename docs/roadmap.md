@@ -1,6 +1,6 @@
 # Dispatch — roadmap
 
-**Current milestone: M1**
+**Current milestone: M4**
 
 Each milestone ends with a commit and a notes file in `docs/`.
 
@@ -10,7 +10,8 @@ Each milestone ends with a commit and a notes file in `docs/`.
 Concepts only, no code. See `docs/00-foundations.md`.
 Latency budget, ASR, turn-taking, interruption handling, telephony layer, challenges, metrics.
 
-## M1 — Telephony transport
+## M1 — Telephony transport ✅
+Notes: `docs/01-telephony.md`
 **Goal:** a real phone call reaches my laptop and I echo the caller's audio back to them.
 
 - Express server + TwiML endpoint that returns a `<Connect><Stream>` response
@@ -25,11 +26,13 @@ streamSid/sequence numbers, `mark` and `clear` messages, why a tunnel is needed.
 **Done when:** I call the number, hear myself echoed back, and can state the measured
 round-trip delay.
 
-## M2 — Streaming ASR
+## M2 — Streaming ASR ✅
+Notes: `docs/02-asr.md`
 Deepgram WebSocket, interim vs final transcripts, endpointing config, keyword boosting for
 HVAC vocabulary, resampling 8kHz μ-law → 16kHz PCM. Measure time-from-speech-end to final.
 
-## M3 — Close the loop
+## M3 — Close the loop ✅
+Notes: `docs/03-loop.md`. Baseline: voice-to-voice p50 1937ms, target 800ms.
 LLM + TTS wired in. First real conversation. Sentence-boundary chunking into TTS. Per-turn
 latency trace logging every hop. Establish the baseline number we spend M4+ improving.
 
