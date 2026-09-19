@@ -1,6 +1,6 @@
 # Dispatch — roadmap
 
-**Current milestone: M4**
+**Current milestone: M5**
 
 Each milestone ends with a commit and a notes file in `docs/`.
 
@@ -36,7 +36,8 @@ Notes: `docs/03-loop.md`. Baseline: voice-to-voice p50 1937ms, target 800ms.
 LLM + TTS wired in. First real conversation. Sentence-boundary chunking into TTS. Per-turn
 latency trace logging every hop. Establish the baseline number we spend M4+ improving.
 
-## M4 — Turn-taking and interruption
+## M4 — Turn-taking and interruption ✅
+Notes: `docs/04-turntaking.md`. Barge-in p50 0.8ms; voice-to-voice p50 1637ms.
 Silero VAD, silence-timer endpointing, then semantic turn detection. Barge-in: detect, stop
 TTS, flush buffer (`clear`), cancel LLM, truncate history to what was actually heard.
 Backchannel filtering.
