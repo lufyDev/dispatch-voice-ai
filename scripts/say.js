@@ -80,7 +80,6 @@ function render(text) {
 // genuinely have finished. Answering instantly would defeat the test.
 let agentAudioMs = 0;
 let firstAudioAt = null;
-let markResolve = null;
 
 const ws = new WebSocket(URL);
 
@@ -94,11 +93,7 @@ ws.on('message', (data, isBinary) => {
   if (msg.type !== 'mark') return;
   const wait = Math.max(0, (firstAudioAt ?? Date.now()) + agentAudioMs - Date.now());
   console.log(`[say] agent spoke ${(agentAudioMs / 1000).toFixed(2)}s; acking mark in ${wait.toFixed(0)}ms`);
-  setTimeout(() => {
-    ws.send(JSON.stringify({ type: 'mark', name: msg.name }));
-    markResolve?.();
-    markResolve = null;
-  }, wait);
+  setTimeout(() => ws.send(JSON.stringify({ type: 'mark', name: msg.name })), wait);
 });
 
 // ONE continuous 20ms clock for the whole session, exactly like a real phone
@@ -160,9 +155,24 @@ ws.on('open', async () => {
       console.log(`[say] cutting in ${INTERRUPT_MS}ms after the agent started`);
     } else {
       // Wait for the agent to finish speaking before the next turn.
+      //
+      // NOT "until a mark comes back": since per-sentence marks landed, the
+      // first one arrives right behind the agent's first audio chunk, so
+      // resolving on it made this client barge in on every single turn. Wait
+      // for quiescence instead — no new audio arriving, and everything we were
+      // sent already played out.
       await new Promise((r) => {
-        markResolve = r;
-        setTimeout(() => { if (markResolve === r) { markResolve = null; r(); } }, 20000);
+        let previous = -1;
+        const check = setInterval(() => {
+          const playedOut = firstAudioAt !== null && Date.now() >= firstAudioAt + agentAudioMs;
+          if (agentAudioMs > 0 && agentAudioMs === previous && playedOut) {
+            clearInterval(check);
+            r();
+            return;
+          }
+          previous = agentAudioMs;
+        }, 250);
+        setTimeout(() => { clearInterval(check); r(); }, 25000);
       });
     }
   }

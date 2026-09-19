@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import { EnergyVAD } from '../vad/energy.js';
+import { createVad } from '../vad/index.js';
 import { looksComplete } from '../turn/completeness.js';
 
 /**
@@ -14,6 +14,16 @@ import { looksComplete } from '../turn/completeness.js';
  * time to time-to-first-audio. Audio must still PLAY in order, so sentences go
  * into a queue that one worker drains sequentially.
  */
+
+/**
+ * Silence for gagging the ASR while the agent speaks.
+ *
+ * Tried low-level dither here instead of perfect zero, on the theory that
+ * Deepgram was failing to endpoint on digital silence. It made no difference:
+ * the continuation's final still took 6.8s. The delay is Deepgram's, not ours
+ * -- see docs/04-turntaking.md.
+ */
+const SILENT_FRAME = (bytes) => Buffer.alloc(bytes);
 
 /** Pull the first complete sentence off the front of a buffer, if there is one. */
 function takeSentence(buf) {
@@ -80,7 +90,15 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   // Second gate, on content rather than duration: a turn whose entire text is
   // acknowledgement is not a turn. Catches what the duration gate misses --
   // a drawn-out "yeeeah" or a caller who says "okay" twice.
+  //
+  // IT ONLY APPLIES TO SPEECH THAT OVERLAPPED OURS. "Yes" said over the agent
+  // is an acknowledgement; "Yes" said in the caller's own turn is the ANSWER to
+  // a yes/no question, and a booking agent asks a lot of those. Observed:
+  //   AGENT: "Is there no hot water?"
+  //   backchannel ignored: "Yes."     <- wrong, that was the answer
   const BACKCHANNEL_WORDS = /^(mm|mhm|mmhmm|uh huh|uh-huh|hmm|ah|oh|ok|okay|yeah|yep|yes|right|sure|got it|i see)[.!?, ]*$/i;
+  // Did the utterance we are about to process begin while we were talking?
+  let overlapped = false;
 
   // DYNAMIC ENDPOINTING. Deepgram's speech_final fires after 300ms of silence,
   // which cuts a caller in half when they draw breath mid-sentence ("Hi. My" /
@@ -89,7 +107,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   //
   // Instead: reply immediately when the utterance looks finished, and hold it
   // for GRACE_MS when it does not. Only incomplete turns pay the cost.
-  const GRACE_MS = Number(process.env.TURN_GRACE_MS ?? 900);
+  // How long to hold before giving up and replying to the fragment. This is a
+  // BACKSTOP, not the primary release: the primary releases are (a) a new final
+  // that completes the thought, and (b) Deepgram's UtteranceEnd.
+  const GRACE_MS = Number(process.env.TURN_GRACE_MS ?? 1200);
   // Fragments can keep arriving ("I think... the thing... in the..."). Cap the
   // total hold so we never leave a caller waiting indefinitely for a reply.
   const MAX_HOLD_MS = Number(process.env.TURN_MAX_HOLD_MS ?? 4000);
@@ -319,16 +340,20 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // Local VAD, fed EVERY frame including while the agent is speaking -- that
     // is the whole point, since detecting the caller talking over us is what
     // barge-in needs. Logging only for now; 4b acts on it.
-    vad = new EnergyVAD({ sampleRate });
+    const picked = createVad({ sampleRate });
+    vad = picked.vad;
+    console.log(`[${label}] vad=${picked.kind}`);
     vad.on('speechStart', ({ atMs }) => {
       if (speaking) {
         // Provisional. Resolved on the audio clock in the frame handler, not by
         // a wall-clock timer, and not by VAD 'speechEnd' -- that has a 500ms
         // hangover, so it arrives after our 350ms window has already closed.
         bargeCandidate = { atMs };
+        overlapped = true;
         return;
       }
       quietSinceWall = null;
+      overlapped = false;
       console.log(`[${label}] VAD speech start @${atMs}ms`);
     });
     vad.on('speechEnd', ({ atMs }) => {
@@ -337,6 +362,28 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     });
 
     asr.on('error', (err) => console.error(`[${label}] asr error: ${err.message}`));
+
+    /**
+     * UtteranceEnd: Deepgram is certain the turn is over.
+     *
+     * M2 rejected this as the turn signal because it lands ~1765ms after the
+     * last word and cannot be tuned below a 1000ms floor. But for a HELD
+     * fragment it is exactly right: we have already decided to wait, and this
+     * is the only authoritative "nothing more is coming" the ASR offers.
+     *
+     * The alternative was guessing a fixed settle window, and that guess was
+     * wrong twice — 400ms and 700ms both fired before a continuation that was
+     * genuinely in flight, producing "I did not catch that" and costing a whole
+     * wasted round trip. Being slow here is cheaper than being wrong.
+     */
+    asr.on('utteranceEnd', () => {
+      if (!held) return;
+      clearTimeout(held.timer);
+      const h = held;
+      held = null;
+      console.log(`[${label}] utteranceEnd — "${h.text}" really was the whole turn`);
+      fire(h.text, h.lastWordWall);
+    });
 
     // Playback reached our bookmark, so the caller has now HEARD everything we
     // sent. This is the only correct moment to reopen the mic: "finished
@@ -353,13 +400,33 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       if (name !== awaitingMark) return;
       awaitingMark = null;
       speaking = false;
-      // Anything captured while we were talking is our own voice or the caller
-      // talking over us; the second case is handled by bargeIn(), not here.
-      const discarded = pendingFinals.join(' ').trim();
-      pendingFinals = [];
-      if (discarded) console.log(`[${label}] (discarded while speaking: "${discarded}")`);
+      // DO NOT discard pendingFinals here.
+      //
+      // This used to clear them, written in M3 before the gag existed, when the
+      // ASR really could be transcribing our own voice off the caller's speaker.
+      // It cannot now: while `speaking` we feed the ASR silence, so anything it
+      // produces during a reply is the caller's genuine speech, captured before
+      // the gag began.
+      //
+      // It was actively destroying words. Deepgram's time-to-final for a
+      // continuation after a mid-utterance pause measured anywhere from 200ms to
+      // 6.8s, so a late final is normal, not exceptional -- and this line threw
+      // away "42 Oak Street," a full second after the caller said it. Keep the
+      // words; they become the front of the next turn.
+      if (pendingFinals.length) {
+        console.log(`[${label}] carrying over from during our turn: "${pendingFinals.join(' ').trim()}"`);
+      }
     });
-    asr.on('final', ({ text }) => pendingFinals.push(text));
+    const t0dbg = performance.now();
+    if (process.env.DEBUG_ASR) {
+      asr.on('interim', ({ text }) => console.log(`[dbg ${(performance.now() - t0dbg).toFixed(0)}ms] interim "${text}"`));
+      asr.on('speechFinal', ({ text, endMs }) => console.log(`[dbg ${(performance.now() - t0dbg).toFixed(0)}ms] SPEECH_FINAL "${text}" endMs=${endMs}`));
+      asr.on('utteranceEnd', ({ lastWordEndMs }) => console.log(`[dbg ${(performance.now() - t0dbg).toFixed(0)}ms] UTTERANCE_END lastWordEnd=${lastWordEndMs}`));
+    }
+    asr.on('final', ({ text, endMs }) => {
+      if (process.env.DEBUG_ASR) console.log(`[dbg ${(performance.now() - t0dbg).toFixed(0)}ms] final "${text}" endMs=${endMs}`);
+      pendingFinals.push(text);
+    });
 
     // speech_final, not utteranceEnd: 335ms vs 1765ms. See docs/02-asr.md.
     const fire = (text, lastWordWall) => {
@@ -385,9 +452,9 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       pendingFinals = [];
       if (!chunk) return;
 
-      if (BACKCHANNEL_WORDS.test(chunk)) {
+      if (overlapped && BACKCHANNEL_WORDS.test(chunk)) {
         backchannels += 1;
-        console.log(`[${label}] backchannel ignored: "${chunk}"`);
+        console.log(`[${label}] backchannel ignored: "${chunk}" (spoken over us)`);
         return;
       }
 
@@ -418,20 +485,19 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       held = { text, lastWordWall, heldSince };
 
       const expire = () => {
-        // Never fire while they are audibly still going. The grace period is
-        // about a PAUSE; if they resumed, wait for the next final to merge in.
+        // Never fire while they are audibly still going.
         if (vad?.active) {
           held.timer = setTimeout(expire, 100);
           return;
         }
-        // Quiet, but the ASR may still owe us the words from that last burst.
+        // Quiet, but the ASR may still owe us words from that last burst.
         if (quietSinceWall !== null && performance.now() - quietSinceWall < ASR_SETTLE_MS) {
           held.timer = setTimeout(expire, 100);
           return;
         }
         const h = held;
         held = null;
-        console.log(`[${label}] grace expired — "${h.text}" was the whole turn`);
+        console.log(`[${label}] backstop expired — replying to "${h.text}"`);
         fire(h.text, h.lastWordWall);
       };
       held.timer = setTimeout(expire, GRACE_MS);
@@ -476,7 +542,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // out to be a backchannel, the resulting "Mhm." is discarded with the rest
     // of pendingFinals when our turn ends.
     const gag = speaking && !bargeCandidate;
-    asr?.write(gag ? Buffer.alloc(frame.pcm.length) : frame.pcm);
+    asr?.write(gag ? SILENT_FRAME(frame.pcm.length) : frame.pcm);
   });
   transport.on('error', (err) => console.error(`[${label}] transport error: ${err.message}`));
 
