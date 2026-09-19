@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { EnergyVAD } from '../vad/energy.js';
+import { looksComplete } from '../turn/completeness.js';
 
 /**
  * M3: the first real conversation. Transport -> ASR -> LLM -> TTS -> Transport.
@@ -81,6 +82,27 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   // a drawn-out "yeeeah" or a caller who says "okay" twice.
   const BACKCHANNEL_WORDS = /^(mm|mhm|mmhmm|uh huh|uh-huh|hmm|ah|oh|ok|okay|yeah|yep|yes|right|sure|got it|i see)[.!?, ]*$/i;
 
+  // DYNAMIC ENDPOINTING. Deepgram's speech_final fires after 300ms of silence,
+  // which cuts a caller in half when they draw breath mid-sentence ("Hi. My" /
+  // "basement is flooding"). Raising the threshold to 700ms would fix that by
+  // making EVERY turn slower — the lazy default the foundations doc warns about.
+  //
+  // Instead: reply immediately when the utterance looks finished, and hold it
+  // for GRACE_MS when it does not. Only incomplete turns pay the cost.
+  const GRACE_MS = Number(process.env.TURN_GRACE_MS ?? 900);
+  // Fragments can keep arriving ("I think... the thing... in the..."). Cap the
+  // total hold so we never leave a caller waiting indefinitely for a reply.
+  const MAX_HOLD_MS = Number(process.env.TURN_MAX_HOLD_MS ?? 4000);
+  let held = null;
+  let holds = 0;
+  // The VAD knows speech ended before the ASR does: our hangover fires ~500ms
+  // after the last sound, while Deepgram still owes us 300ms of endpointing plus
+  // a network hop. Firing the moment the VAD goes quiet therefore drops the
+  // continuation we were waiting for. Wait this long after quiet for the ASR to
+  // catch up.
+  const ASR_SETTLE_MS = Number(process.env.TURN_ASR_SETTLE_MS ?? 400);
+  let quietSinceWall = null;
+
   // WHERE PLAYBACK ACTUALLY IS.
   //
   // Marks are the only ground truth about what a caller HEARD; `send` only ever
@@ -156,6 +178,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     speaking = false;           // 4. start listening again
     awaitingMark = null;        // the mark we were waiting on will never arrive
     bargeCandidate = null;
+    if (held) { clearTimeout(held.timer); held = null; }
     // Anything the ASR captured while we spoke is our own voice, or a fragment
     // of the interruption we are about to hear properly.
     pendingFinals = [];
@@ -305,9 +328,13 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
         bargeCandidate = { atMs };
         return;
       }
+      quietSinceWall = null;
       console.log(`[${label}] VAD speech start @${atMs}ms`);
     });
-    vad.on('speechEnd', ({ atMs }) => console.log(`[${label}] VAD speech end @${atMs}ms`));
+    vad.on('speechEnd', ({ atMs }) => {
+      quietSinceWall = performance.now();
+      console.log(`[${label}] VAD speech end @${atMs}ms`);
+    });
 
     asr.on('error', (err) => console.error(`[${label}] asr error: ${err.message}`));
 
@@ -335,24 +362,13 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     asr.on('final', ({ text }) => pendingFinals.push(text));
 
     // speech_final, not utteranceEnd: 335ms vs 1765ms. See docs/02-asr.md.
-    asr.on('speechFinal', ({ endMs }) => {
-      // Wall-clock time of the caller's last word, via the audio clock.
-      const lastWordWall = audioZeroWall === null ? performance.now() : audioZeroWall + endMs;
-      const userText = pendingFinals.join(' ').trim();
-      pendingFinals = [];
-      if (!userText) return;
-      if (BACKCHANNEL_WORDS.test(userText)) {
-        backchannels += 1;
-        console.log(`[${label}] backchannel ignored: "${userText}"`);
-        return;
-      }
-      // No barge-in yet (that is M4) -- for now, ignore speech while replying.
+    const fire = (text, lastWordWall) => {
       if (turnBusy) {
-        console.log(`[${label}] (ignored while speaking: "${userText}")`);
+        console.log(`[${label}] (ignored while speaking: "${text}")`);
         return;
       }
       turnBusy = true;
-      runTurn(userText, lastWordWall)
+      runTurn(text, lastWordWall)
         .catch((err) => {
           // An abort is barge-in working as designed, not an error. fetch()
           // surfaces it as a DOMException named AbortError.
@@ -360,6 +376,65 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
           console.error(`[${label}] turn failed: ${err.message}`);
         })
         .finally(() => { turnBusy = false; });
+    };
+
+    asr.on('speechFinal', ({ endMs }) => {
+      // Wall-clock time of the caller's last word, via the audio clock.
+      const lastWordWall = audioZeroWall === null ? performance.now() : audioZeroWall + endMs;
+      const chunk = pendingFinals.join(' ').trim();
+      pendingFinals = [];
+      if (!chunk) return;
+
+      if (BACKCHANNEL_WORDS.test(chunk)) {
+        backchannels += 1;
+        console.log(`[${label}] backchannel ignored: "${chunk}"`);
+        return;
+      }
+
+      // Glue this onto anything we were holding back.
+      let text = chunk;
+      let heldSince = performance.now();
+      if (held) {
+        clearTimeout(held.timer);
+        text = `${held.text} ${chunk}`.trim();
+        heldSince = held.heldSince;
+        held = null;
+      }
+
+      const verdict = looksComplete(text);
+      if (verdict.complete) {
+        fire(text, lastWordWall);
+        return;
+      }
+
+      if (performance.now() - heldSince >= MAX_HOLD_MS) {
+        console.log(`[${label}] held ${MAX_HOLD_MS}ms already — replying to "${text}" regardless`);
+        fire(text, lastWordWall);
+        return;
+      }
+
+      holds += 1;
+      console.log(`[${label}] HOLD "${text}" — ${verdict.reason}`);
+      held = { text, lastWordWall, heldSince };
+
+      const expire = () => {
+        // Never fire while they are audibly still going. The grace period is
+        // about a PAUSE; if they resumed, wait for the next final to merge in.
+        if (vad?.active) {
+          held.timer = setTimeout(expire, 100);
+          return;
+        }
+        // Quiet, but the ASR may still owe us the words from that last burst.
+        if (quietSinceWall !== null && performance.now() - quietSinceWall < ASR_SETTLE_MS) {
+          held.timer = setTimeout(expire, 100);
+          return;
+        }
+        const h = held;
+        held = null;
+        console.log(`[${label}] grace expired — "${h.text}" was the whole turn`);
+        fire(h.text, h.lastWordWall);
+      };
+      held.timer = setTimeout(expire, GRACE_MS);
     });
   });
 
@@ -382,6 +457,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
         console.log(`[${label}] backchannel ignored @${bargeCandidate.atMs}ms (quiet again after ${BACKCHANNEL_MS - quietForMs}ms) — still speaking`);
       }
       bargeCandidate = null;
+    if (held) { clearTimeout(held.timer); held = null; }
     }
 
     // Half-duplex: deaf while talking. Crude, and it makes interruption
@@ -406,6 +482,8 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
   transport.on('stop', () => {
     asr?.finish();
+    if (held) { clearTimeout(held.timer); held = null; }
+    if (holds) console.log(`[${label}] incomplete utterances held: ${holds}`);
     if (backchannels) console.log(`[${label}] backchannels ignored: ${backchannels}`);
     if (bargeIns.length) {
       const sorted = [...bargeIns].sort((a, b) => a - b);

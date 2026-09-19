@@ -15,6 +15,12 @@
  * INTERRUPT_MS=1200 makes each turn start 1200ms after the agent BEGINS
  * speaking, instead of waiting politely for it to finish. That is barge-in, and
  * there is no other way to test it.
+ *
+ * A "|" in the text inserts PAUSE_MS of silence — a breath mid-sentence, which
+ * `say` never produces on its own and which is exactly what splits a real
+ * caller's turn in half:
+ *
+ *   node scripts/say.js "hi my | basement is flooding"
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
@@ -29,6 +35,9 @@ const VOICE = process.env.SAY_VOICE || 'Samantha';
 const RATE = 8000;
 const FRAME_BYTES = 160 * 2; // 20ms of PCM16
 const LEAD_MS = 400;         // silence before speaking, so the ASR settles
+// Silence inserted at a "|" — a mid-sentence breath. Longer than Deepgram's
+// 300ms endpointing, so it really does split the utterance.
+const PAUSE_MS = Number(process.env.PAUSE_MS || 500);
 const TAIL_MS = 1500;        // silence after, so endpointing fires
 // Talk over the agent this many ms after it starts speaking. 0 = wait politely.
 const INTERRUPT_MS = Number(process.env.INTERRUPT_MS || 0);
@@ -45,13 +54,25 @@ function wavPcm(buf) {
   throw new Error('no data chunk in wav');
 }
 
-function render(text) {
+const pad = (ms) => Buffer.alloc(Math.round(RATE * ms / 1000) * 2);
+
+function renderOne(text) {
   const tmp = `/tmp/dispatch-say-${process.pid}.wav`;
   execFileSync('say', ['-v', VOICE, '--data-format=LEI16@8000', '--file-format=WAVE', '-o', tmp, text]);
   const speech = wavPcm(readFileSync(tmp));
   unlinkSync(tmp);
-  const pad = (ms) => Buffer.alloc((RATE * ms / 1000) * 2);
-  return Buffer.concat([pad(LEAD_MS), speech, pad(TAIL_MS)]);
+  return speech;
+}
+
+function render(text) {
+  const parts = text.split('|').map((p) => p.trim()).filter(Boolean);
+  const chunks = [pad(LEAD_MS)];
+  parts.forEach((part, i) => {
+    if (i > 0) chunks.push(pad(PAUSE_MS));
+    chunks.push(renderOne(part));
+  });
+  chunks.push(pad(TAIL_MS));
+  return Buffer.concat(chunks);
 }
 
 // We must behave like a real playback device: the server waits for a `mark`
