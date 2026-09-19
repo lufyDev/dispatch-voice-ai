@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+import { EnergyVAD } from '../vad/energy.js';
 
 /**
  * M3: the first real conversation. Transport -> ASR -> LLM -> TTS -> Transport.
@@ -27,6 +28,7 @@ function takeSentence(buf) {
 }
 
 export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, label = 'call' }) {
+  let vad = null;
   const history = [{ role: 'system', content: systemPrompt }];
   let asr = null;
   let pendingFinals = [];
@@ -135,6 +137,15 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     console.log(`[${label}] start callId=${callId} sampleRate=${sampleRate}`);
     asr = createAsr({ sampleRate });
 
+    // Local VAD, fed EVERY frame including while the agent is speaking -- that
+    // is the whole point, since detecting the caller talking over us is what
+    // barge-in needs. Logging only for now; 4b acts on it.
+    vad = new EnergyVAD({ sampleRate });
+    vad.on('speechStart', ({ atMs }) => {
+      console.log(`[${label}] VAD speech start @${atMs}ms${speaking ? '  <-- WHILE AGENT SPEAKING (barge-in candidate)' : ''}`);
+    });
+    vad.on('speechEnd', ({ atMs }) => console.log(`[${label}] VAD speech end @${atMs}ms`));
+
     asr.on('error', (err) => console.error(`[${label}] asr error: ${err.message}`));
 
     // Playback reached our bookmark, so the caller has now HEARD everything we
@@ -175,6 +186,11 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
   transport.on('frame', (frame) => {
     if (audioZeroWall === null) audioZeroWall = performance.now() - frame.timestampMs;
+    // The VAD always sees real audio, even while we are speaking. The ASR does
+    // not. That asymmetry is deliberate: we need to know the caller started
+    // talking without paying to transcribe our own voice back to ourselves.
+    vad?.push(frame.pcm, frame.timestampMs);
+
     // Half-duplex: deaf while talking. Crude, and it makes interruption
     // impossible -- M4 replaces this with a real VAD that can tell the caller's
     // voice from our own echo and cut us off mid-sentence.
