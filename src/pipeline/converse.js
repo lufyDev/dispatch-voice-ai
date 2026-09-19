@@ -178,8 +178,14 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // Half-duplex: deaf while talking. Crude, and it makes interruption
     // impossible -- M4 replaces this with a real VAD that can tell the caller's
     // voice from our own echo and cut us off mid-sentence.
-    if (speaking) return;
-    asr?.write(frame.pcm);
+    //
+    // We feed SILENCE rather than dropping the frame. Deepgram's timestamps
+    // count the audio we send it, so withholding audio makes its clock fall
+    // behind the call's clock by the total time the agent has spoken -- and
+    // every latency measurement drifts with it, growing every turn. Feeding
+    // silence keeps one shared timeline, and it also hands the ASR a genuine
+    // pause boundary between turns, which is what its endpointing wants.
+    asr?.write(speaking ? Buffer.alloc(frame.pcm.length) : frame.pcm);
   });
   transport.on('error', (err) => console.error(`[${label}] transport error: ${err.message}`));
 
