@@ -47,6 +47,63 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   // The in-flight turn's abort handle, hoisted so barge-in can reach it.
   let turnAbort = null;
   const bargeIns = [];
+  let rate = 8000;
+
+  // WHERE PLAYBACK ACTUALLY IS.
+  //
+  // Marks are the only ground truth about what a caller HEARD; `send` only ever
+  // tells you what you handed over. So we track one timeline per turn:
+  //
+  //   sentMs        audio handed to the transport so far, in ms
+  //   markPos       mark name -> its position on that timeline
+  //   playPos/Wall  the last position a mark confirmed, and when it came back
+  //   spoken[]      each sentence's [startMs, endMs) on the same timeline
+  //
+  // Current playback position is then playPos + (now - playWall), and marks can
+  // be placed anywhere without special cases.
+  let sentMs = 0;
+  let markPos = new Map();
+  let playPos = 0;
+  let playWall = null;
+  let spoken = [];
+
+  function placeMark(name) {
+    markPos.set(name, sentMs);
+    transport.mark(name);
+  }
+
+  function resetPlayback() {
+    sentMs = 0;
+    markPos = new Map();
+    playPos = 0;
+    playWall = null;
+    spoken = [];
+  }
+
+  /**
+   * What the caller actually heard of the current reply.
+   *
+   * Sentences fully behind the playback cursor are certain. For the one the
+   * cursor is inside we interpolate by word — the best resolution available
+   * without a mark per word, which would be absurd.
+   */
+  function heardSoFar() {
+    if (playWall === null) return ''; // no mark has come back: nothing confirmed
+    const pos = playPos + (performance.now() - playWall);
+
+    const parts = [];
+    for (const sentence of spoken) {
+      if (pos >= sentence.endMs) { parts.push(sentence.text); continue; }
+      if (pos <= sentence.startMs) break;
+      const frac = (pos - sentence.startMs) / (sentence.endMs - sentence.startMs);
+      const words = sentence.text.split(/\s+/);
+      const kept = words.slice(0, Math.floor(words.length * frac));
+      // The dash reads to the LLM as "cut off here", which is what happened.
+      if (kept.length) parts.push(`${kept.join(' ')}—`);
+      break;
+    }
+    return parts.join(' ').trim();
+  }
 
   /**
    * The caller started talking while we were. Five things must happen, and the
@@ -70,12 +127,22 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // of the interruption we are about to hear properly.
     pendingFinals = [];
 
-    // 5. Truncating history to what the caller actually HEARD is diff 4c. Right
-    //    now the agent still believes it said the whole sentence.
+    // 5. Record what the caller ACTUALLY HEARD, not what we generated. Skipping
+    //    this is the classic voice-agent bug: the agent believes it asked a
+    //    question the human never heard, then acts baffled when it goes
+    //    unanswered, or repeats itself with "as I was saying".
+    const heard = heardSoFar();
+    if (heard) {
+      history.push({ role: 'assistant', content: heard });
+      console.log(`[${label}] AGENT (heard only): "${heard}"`);
+    }
+    resetPlayback();
+
     const took = performance.now() - t0;
     bargeIns.push(took);
     console.log(`[${label}] BARGE-IN at audio ${atMs}ms — cleared + aborted in ${took.toFixed(1)}ms`);
   }
+
   const turnLags = [];
 
   async function runTurn(userText, lastWordWall) {
@@ -91,22 +158,41 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     const ac = new AbortController();
     turnAbort = ac;
 
+    const turnId = ++markSeq;
+    const markName = (i) => `t${turnId}-s${i}`;
+    resetPlayback();
+
     const sentences = [];
     let queueDone = false;
     let worker = null;
 
     // Drains sentences in order. Started as soon as the FIRST sentence exists.
     async function drain() {
+      let placedStart = false;
+
       while (sentences.length || !queueDone) {
         if (ac.signal.aborted) return;
         const next = sentences.shift();
         if (!next) { await new Promise((r) => setTimeout(r, 5)); continue; }
+
+        const startMs = sentMs;
         for await (const pcm of tts.speak(next, { signal: ac.signal })) {
           if (t.ttsFirstByte === undefined) t.ttsFirstByte = performance.now();
           speaking = true;
           transport.send(pcm);
+          sentMs += (pcm.length / 2 / rate) * 1000;
           if (t.firstAudioOut === undefined) t.firstAudioOut = performance.now();
+
+          // Place the first mark right behind the first chunk of real audio,
+          // not before it. A mark sent while the far end's queue is empty gets
+          // scheduled at "now" and returns immediately -- hundreds of ms before
+          // playback actually starts -- which would inflate what we believe the
+          // caller heard.
+          if (!placedStart) { placedStart = true; placeMark(markName(0)); }
         }
+
+        spoken.push({ text: next, startMs, endMs: sentMs });
+        placeMark(markName(spoken.length));
       }
     }
 
@@ -138,11 +224,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
     if (ac.signal.aborted) return; // interrupted: no mark, no trace, no history
 
-    // Bookmark behind the last audio chunk. `speaking` stays true until the
-    // transport tells us playback reached it.
+    // The last sentence's mark doubles as the end-of-turn mark: `speaking` stays
+    // true until the transport tells us playback reached it.
     if (t.firstAudioOut !== undefined) {
-      awaitingMark = `turn-${++markSeq}`;
-      transport.mark(awaitingMark);
+      awaitingMark = markName(spoken.length);
       // A transport whose far end never reports the mark (dropped call, a
       // transport that does not implement marks) must not wedge the mic shut.
       const stuck = awaitingMark;
@@ -172,6 +257,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
   transport.on('start', ({ callId, sampleRate }) => {
     console.log(`[${label}] start callId=${callId} sampleRate=${sampleRate}`);
+    rate = sampleRate;
     asr = createAsr({ sampleRate });
 
     // Local VAD, fed EVERY frame including while the agent is speaking -- that
@@ -196,12 +282,18 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // sending" is 3+ seconds earlier, because generating a reply is much faster
     // than speaking it.
     transport.on('mark', (name) => {
+      // Every mark advances the playback cursor, not just the final one. This
+      // is the ground truth that makes "what did they hear?" answerable.
+      if (markPos.has(name)) {
+        playPos = markPos.get(name);
+        playWall = performance.now();
+      }
+
       if (name !== awaitingMark) return;
       awaitingMark = null;
       speaking = false;
       // Anything captured while we were talking is our own voice or the caller
-      // talking over us. We cannot use either yet -- handling the second case
-      // properly is barge-in, which is M4.
+      // talking over us; the second case is handled by bargeIn(), not here.
       const discarded = pendingFinals.join(' ').trim();
       pendingFinals = [];
       if (discarded) console.log(`[${label}] (discarded while speaking: "${discarded}")`);
