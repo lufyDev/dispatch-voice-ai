@@ -52,6 +52,16 @@ export class EnergyVAD extends VAD {
   #quietRun = 0;
   #active = false;
 
+  /**
+   * Audio-clock timestamp of the most recent loud frame, UNSMOOTHED.
+   *
+   * `active` is deliberately sticky -- it holds through the 500ms hangover so
+   * words do not get chopped apart. That makes it useless for asking "are they
+   * still talking right now?", which is exactly what backchannel filtering needs
+   * to decide inside a 350ms window. This is the raw signal for that question.
+   */
+  lastLoudAtMs = -Infinity;
+
   constructor({
     sampleRate = 8000,
     // 3 frames = 60ms of sustained sound before we believe it. This IS the
@@ -120,6 +130,7 @@ export class EnergyVAD extends VAD {
     if (loud) {
       this.#loudRun += 1;
       this.#quietRun = 0;
+      this.lastLoudAtMs = timestampMs;
     } else {
       this.#quietRun += 1;
       this.#loudRun = 0;

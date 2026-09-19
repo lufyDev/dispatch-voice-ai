@@ -49,6 +49,38 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   const bargeIns = [];
   let rate = 8000;
 
+  // BACKCHANNELS. "mhm", "yeah", "okay", "right" are the listener saying "I am
+  // still here, keep going" -- not an interruption. An agent that stops dead for
+  // those is exhausting to talk to.
+  //
+  // DURATION CANNOT SOLVE THIS, and it is worth knowing why. Measured voiced
+  // lengths of synthetic speech:
+  //
+  //   "mhm"    740ms   backchannel
+  //   "uh huh" 600ms   backchannel
+  //   "okay"   520ms   backchannel
+  //   "yeah"   420ms   backchannel
+  //   "right"  300ms   backchannel
+  //   "wait"   ~300ms  INTERRUPTION
+  //
+  // The distributions overlap: "wait" and "stop" are shorter than "mhm". A
+  // window long enough to catch "mhm" would talk over a real interruption for
+  // three quarters of a second.
+  //
+  // So this window is deliberately SHORT. It filters clicks, coughs and chair
+  // scrapes, and nothing more. "mhm" will stop the agent, and we accept that:
+  // being talked over feels worse to a human than an agent that pauses when it
+  // did not need to. The real fix is resuming the remainder after a false
+  // barge-in, which needs the ASR's verdict and is not built yet.
+  const BACKCHANNEL_MS = 250;
+  let bargeCandidate = null;
+  let backchannels = 0;
+
+  // Second gate, on content rather than duration: a turn whose entire text is
+  // acknowledgement is not a turn. Catches what the duration gate misses --
+  // a drawn-out "yeeeah" or a caller who says "okay" twice.
+  const BACKCHANNEL_WORDS = /^(mm|mhm|mmhmm|uh huh|uh-huh|hmm|ah|oh|ok|okay|yeah|yep|yes|right|sure|got it|i see)[.!?, ]*$/i;
+
   // WHERE PLAYBACK ACTUALLY IS.
   //
   // Marks are the only ground truth about what a caller HEARD; `send` only ever
@@ -123,6 +155,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
 
     speaking = false;           // 4. start listening again
     awaitingMark = null;        // the mark we were waiting on will never arrive
+    bargeCandidate = null;
     // Anything the ASR captured while we spoke is our own voice, or a fragment
     // of the interruption we are about to hear properly.
     pendingFinals = [];
@@ -266,9 +299,10 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     vad = new EnergyVAD({ sampleRate });
     vad.on('speechStart', ({ atMs }) => {
       if (speaking) {
-        // Every voice counts as an interruption for now, including "mhm" and
-        // "okay" — filtering backchannels is diff 4d.
-        bargeIn(atMs);
+        // Provisional. Resolved on the audio clock in the frame handler, not by
+        // a wall-clock timer, and not by VAD 'speechEnd' -- that has a 500ms
+        // hangover, so it arrives after our 350ms window has already closed.
+        bargeCandidate = { atMs };
         return;
       }
       console.log(`[${label}] VAD speech start @${atMs}ms`);
@@ -307,6 +341,11 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       const userText = pendingFinals.join(' ').trim();
       pendingFinals = [];
       if (!userText) return;
+      if (BACKCHANNEL_WORDS.test(userText)) {
+        backchannels += 1;
+        console.log(`[${label}] backchannel ignored: "${userText}"`);
+        return;
+      }
       // No barge-in yet (that is M4) -- for now, ignore speech while replying.
       if (turnBusy) {
         console.log(`[${label}] (ignored while speaking: "${userText}")`);
@@ -331,6 +370,20 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // talking without paying to transcribe our own voice back to ourselves.
     vad?.push(frame.pcm, frame.timestampMs);
 
+    // Resolve a pending barge-in candidate once the window has elapsed in AUDIO
+    // time. Still making noise => a real interruption. Gone quiet => a
+    // backchannel, and we keep talking.
+    if (bargeCandidate && frame.timestampMs - bargeCandidate.atMs >= BACKCHANNEL_MS) {
+      const quietForMs = frame.timestampMs - vad.lastLoudAtMs;
+      if (quietForMs <= 60) {
+        bargeIn(bargeCandidate.atMs);
+      } else {
+        backchannels += 1;
+        console.log(`[${label}] backchannel ignored @${bargeCandidate.atMs}ms (quiet again after ${BACKCHANNEL_MS - quietForMs}ms) — still speaking`);
+      }
+      bargeCandidate = null;
+    }
+
     // Half-duplex: deaf while talking. Crude, and it makes interruption
     // impossible -- M4 replaces this with a real VAD that can tell the caller's
     // voice from our own echo and cut us off mid-sentence.
@@ -341,12 +394,19 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // every latency measurement drifts with it, growing every turn. Feeding
     // silence keeps one shared timeline, and it also hands the ASR a genuine
     // pause boundary between turns, which is what its endpointing wants.
-    asr?.write(speaking ? Buffer.alloc(frame.pcm.length) : frame.pcm);
+    // While a barge-in candidate is pending we feed REAL audio, not silence:
+    // if it turns out to be an interruption, its first 350ms would otherwise be
+    // lost and the caller would have to repeat their first words. If it turns
+    // out to be a backchannel, the resulting "Mhm." is discarded with the rest
+    // of pendingFinals when our turn ends.
+    const gag = speaking && !bargeCandidate;
+    asr?.write(gag ? Buffer.alloc(frame.pcm.length) : frame.pcm);
   });
   transport.on('error', (err) => console.error(`[${label}] transport error: ${err.message}`));
 
   transport.on('stop', () => {
     asr?.finish();
+    if (backchannels) console.log(`[${label}] backchannels ignored: ${backchannels}`);
     if (bargeIns.length) {
       const sorted = [...bargeIns].sort((a, b) => a - b);
       console.log(`[${label}] barge-ins: n=${sorted.length} p50=${sorted[Math.floor(sorted.length / 2)].toFixed(1)}ms max=${sorted.at(-1).toFixed(1)}ms`);
