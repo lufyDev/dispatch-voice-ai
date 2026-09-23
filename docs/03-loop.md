@@ -100,7 +100,52 @@ link, so this is OpenAI's edge presence specifically, not distance in general.
 `tts-first-byte` lands **291ms** after the first sentence exists. That was the hop I expected
 to fight. It needed no tuning.
 
-### 3. A free ElevenLabs account cannot use Voice Library voices via the API
+### 3. The first turn of a call costs 4x the fourth, and it is just TLS
+
+Found in a live demo. One call, four turns:
+
+| turn | llm first token | tts first byte | total |
+|---|---|---|---|
+| 1st | 2652ms | 5197ms | **5198ms** |
+| 2nd | 1425ms | 1929ms | 1930ms |
+| 3rd | 1341ms | 1701ms | 1701ms |
+| 4th | 997ms | 1207ms | **1207ms** |
+
+Not the model warming up -- there is no such thing. It is opening two fresh HTTPS
+connections. A TLS handshake is several round trips, and from here each one is
+expensive. Confirmed by accident: the caller hung up and redialled without
+restarting the server, so the pooled connections survived, and that call's first
+turn was **1896ms instead of 5198ms**.
+
+Fixed by handshaking with both vendors when the call connects, while the caller is
+still saying hello. `warm()` on the LLM and TTS interfaces, measured over fresh
+processes:
+
+```
+COLD   llm-ttft=2802ms  tts-ttfb=2005ms
+COLD   llm-ttft=1387ms  tts-ttfb=294ms
+COLD   llm-ttft=1404ms  tts-ttfb=278ms
+WARM   llm-ttft=659ms   tts-ttfb=286ms   (warm-up itself 1229ms)
+WARM   llm-ttft=713ms   tts-ttfb=275ms   (warm-up itself 420ms)
+WARM   llm-ttft=675ms   tts-ttfb=282ms   (warm-up itself 974ms)
+```
+
+**LLM time-to-first-token halves, ~1400ms -> ~680ms.** TTS barely moves once the OS
+has cached DNS, but the genuinely-cold first run paid 2005ms there too.
+
+Two details worth keeping:
+
+- The warm-up only needs the TCP + TLS handshake and the DNS lookup. **The HTTP
+  response is irrelevant** -- a 401 pools the connection exactly as well as a 200. So
+  it is a HEAD request, costs no tokens and no TTS characters, and our TTS-scoped key
+  401ing is fine.
+- It takes 420-1229ms, which is free only because it overlaps the caller's greeting.
+  It must never be awaited before serving audio, and must never throw: a call should
+  not fail because a warm-up did.
+
+Live, first turn after the fix: **1356ms**, down from 5198ms.
+
+### 4. A free ElevenLabs account cannot use Voice Library voices via the API
 
 `21m00Tcm4TlvDq8ikWAM` (Rachel) returns `402 paid_plan_required: "Free users cannot use library
 voices via the API"`. Probed candidates with a TTS-scoped key:
@@ -119,7 +164,7 @@ Text-to-Speech only, so `GET /v1/voices` returned `401 missing permission voices
 least-privilege behaviour, mildly inconvenient. Probing 6 voices with the text `"ok"` cost 12
 characters of the 10k/month quota.
 
-### 4. The agent heard itself, and my guard was worthless
+### 5. The agent heard itself, and my guard was worthless
 
 The worst bug of the milestone:
 
@@ -152,7 +197,7 @@ instantly would have defeated the test.
 
 This is **half-duplex**: deaf while talking, so interruption is impossible. That is M4's job.
 
-### 5. `.env` silently overrode the code default
+### 6. `.env` silently overrode the code default
 
 `PIPELINE` defaulted to `converse` in code but was pinned to `transcribe` in `.env`, so a full
 session ran with no LLM and no TTS and looked like it had "worked fine". Also: `node --watch`

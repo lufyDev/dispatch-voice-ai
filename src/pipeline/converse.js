@@ -340,6 +340,12 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // Local VAD, fed EVERY frame including while the agent is speaking -- that
     // is the whole point, since detecting the caller talking over us is what
     // barge-in needs. Logging only for now; 4b acts on it.
+    // Handshake with the LLM and TTS while the caller is still saying hello,
+    // so the first turn is not paying for two cold TLS connections.
+    Promise.all([llm.warm?.(), tts.warm?.()])
+      .then(() => console.log(`[${label}] llm + tts connections warmed`))
+      .catch(() => {});
+
     const picked = createVad({ sampleRate });
     vad = picked.vad;
     console.log(`[${label}] vad=${picked.kind}`);

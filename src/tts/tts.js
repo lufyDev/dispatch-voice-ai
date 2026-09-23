@@ -16,4 +16,7 @@ export class TTS {
   async *speak(_text, _opts) {
     throw new Error('not implemented');
   }
+
+  /** Open the connection before we need it. See LLM.warm(). */
+  async warm() {}
 }

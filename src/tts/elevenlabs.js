@@ -33,6 +33,22 @@ export class ElevenLabsTTS extends TTS {
     this.#model = model;
   }
 
+  /**
+   * Handshake only. Our key is scoped to text-to-speech, so this 401s -- which
+   * is fine and in fact the point: the TLS session is established either way,
+   * and a HEAD spends no characters from the free tier's monthly quota.
+   */
+  async warm() {
+    try {
+      await fetch('https://api.elevenlabs.io/v1/user/subscription', {
+        method: 'HEAD',
+        headers: { 'xi-api-key': this.#apiKey },
+      });
+    } catch {
+      // A failed warm-up is not a failed call.
+    }
+  }
+
   async *speak(text, { signal } = {}) {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.#voiceId}/stream`
       + `?output_format=ulaw_8000`;

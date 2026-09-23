@@ -78,6 +78,20 @@ export function looksComplete(text) {
   // "basement is flooding." did.
   const punctuated = /[.!?]$/.test(trimmed);
 
+  // A terminal ? or ! outranks everything below.
+  //
+  // Deepgram writes "?" only where it believes a QUESTION ended, and a finished
+  // question is a finished thought whatever word it lands on. Observed cost of
+  // not doing this: "What all you can do?" was held for 1344ms because it ends
+  // on "do", which is in DANGLING for good reasons ("do you have...", "did
+  // they..."). The question mark was sitting right there.
+  //
+  // "." is deliberately NOT included: it is the default terminator and much
+  // weaker evidence. Deepgram will happily punctuate a fragment with one.
+  if (/[?!]$/.test(trimmed)) {
+    return { complete: true, reason: 'terminal ? or !' };
+  }
+
   // This check must precede DANGLING, because some words are both. "no" is a
   // complete answer ("No.") and a determiner ("there is no hot water"), and
   // punctuation is the only thing that separates them. Same for "that", "this".

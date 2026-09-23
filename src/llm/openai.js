@@ -23,6 +23,22 @@ export class OpenAILLM extends LLM {
     this.#maxTokens = maxTokens;
   }
 
+  /**
+   * We want the TCP + TLS handshake and the DNS lookup, nothing else. The HTTP
+   * response is irrelevant -- a 401 warms undici's connection pool exactly as
+   * well as a 200, and costs no tokens. HEAD so there is no body either way.
+   */
+  async warm() {
+    try {
+      await fetch(ENDPOINT, {
+        method: 'HEAD',
+        headers: { Authorization: `Bearer ${this.#apiKey}` },
+      });
+    } catch {
+      // A failed warm-up is not a failed call.
+    }
+  }
+
   async *stream(messages, { signal } = {}) {
     const res = await fetch(ENDPOINT, {
       method: 'POST',

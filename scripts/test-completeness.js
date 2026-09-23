@@ -12,6 +12,15 @@ const CASES = [
   ['basement is flooding.', true],
   ['Hi. My basement is flooding.', true],
 
+  // a terminal ? or ! finishes a thought whatever word it lands on.
+  // "What all you can do?" was held 1344ms in a live demo before this rule.
+  ['What all you can do?', true],
+  ['What can you do?', true],
+  ['Is that right?', true],
+  ['Can you?', true],
+  ['Stop it!', true],
+  ['So what should I do?', true],
+
   // dangling words
   ['my address is', false],
   ['my address is 42 Oak Street.', true],

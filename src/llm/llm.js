@@ -16,4 +16,17 @@ export class LLM {
   async *stream(_messages, _opts) {
     throw new Error('not implemented');
   }
+
+  /**
+   * Open the connection before we need it.
+   *
+   * Measured on a live demo: the first turn of a call cost 5198ms against
+   * 1207ms for the fourth, because TLS to a fresh origin is several round trips
+   * and every round trip from here is expensive. The first turn is also the one
+   * that decides whether a caller trusts the thing.
+   *
+   * Optional, and must never throw -- a transport should not fail a call because
+   * a warm-up 401'd.
+   */
+  async warm() {}
 }

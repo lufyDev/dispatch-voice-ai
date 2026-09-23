@@ -205,7 +205,31 @@ A content gate catches what duration cannot, but it is a second line of defence,
 **you cannot un-hear a `clear()`.** The agent has already gone quiet by the time the words
 arrive.
 
-### 5. The content gate ate a legitimate answer
+### 5. A terminal "?" beats any dangling-word rule
+
+Found in a live demo, not in testing:
+
+```
+HOLD "What all you can do?" — ends on "do", which needs a continuation
+utteranceEnd — "What all you can do?" really was the whole turn
+asr-turn-signal=1344ms
+```
+
+A complete question, held for 1.3 seconds. "do" is in DANGLING for good reasons
+("do you have...", "did they..."), but *"what can you do?"* ends on it and is
+finished. The evidence was sitting in the string: Deepgram writes "?" only where it
+believes a question ended, and a finished question is a finished thought whatever
+word it lands on.
+
+`.` is deliberately NOT treated the same way -- it is the default terminator and much
+weaker evidence. Deepgram will punctuate a fragment with one.
+
+After the fix, the same utterance fires at **112ms** with no hold.
+
+The safety net did work -- `utteranceEnd` rescued it rather than the agent answering a
+fragment -- but a safety net catching a preventable fall is not a success.
+
+### 6. The content gate ate a legitimate answer
 
 ```
 AGENT: "Is there no hot water?"
@@ -216,7 +240,7 @@ backchannel ignored: "Yes."     <- that was the ANSWER
 yes/no question — and a booking agent asks a lot of those. The filter now applies only to
 speech that *overlapped* ours.
 
-### 6. Waiting on the VAD is not waiting on the ASR
+### 7. Waiting on the VAD is not waiting on the ASR
 
 First attempt at dynamic endpointing released a held fragment when the VAD went quiet. It
 still split utterances, because **the VAD knows speech ended before the ASR does**: our
@@ -224,7 +248,7 @@ hangover fires ~500ms after the last sound, while Deepgram still owes 300ms of e
 plus a network hop. We were firing on the wrong signal and dropping the very continuation we
 were holding for.
 
-### 7. A line written for one reason became a bug when its reason expired
+### 8. A line written for one reason became a bug when its reason expired
 
 The mark handler discarded `pendingFinals`. That was correct in M3, when the ASR really could
 be transcribing the agent's own voice off the caller's speaker. Once the gag existed — we feed
@@ -246,7 +270,7 @@ guard, because it looks deliberate.**
 | VAD cost per 20ms frame | energy 11µs, silero 156µs |
 | Paused utterance merged into one turn | asr-turn-signal **266ms** (no grace penalty) |
 | Voice-to-voice, 3 interrupted turns | p50 **1637ms**, max 2314ms |
-| Completeness classifier | 23/23 cases |
+| Completeness classifier | 29/29 cases |
 
 A held fragment that gets completed by the next chunk fires **on the merge**, not on timer
 expiry — so the grace period is only paid by an utterance that genuinely was finished but
