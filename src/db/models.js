@@ -70,9 +70,26 @@ const jobSchema = new Schema(
   { timestamps: true }
 );
 
-// Availability is computed from this: a technician's booked windows. Compound
-// index because every availability check filters on exactly these three.
-jobSchema.index({ technician: 1, slotStart: 1, status: 1 });
+/**
+ * TWO different double-booking guards, because they stop different things.
+ *
+ * idempotencyKey stops US booking twice — a retried tool call, a model that
+ * did not notice its own success. It cannot stop two SEPARATE callers being
+ * promised the same technician at the same time: different calls derive
+ * different keys, both writes are legitimate, and both succeed.
+ *
+ * This one closes that. A technician cannot hold two active jobs starting at
+ * the same instant, enforced by the database rather than by a
+ * check-then-insert in application code, which always has a window between the
+ * check and the insert.
+ *
+ * `status` is in the key deliberately: a cancelled job must not keep blocking
+ * the slot it used to occupy. (A partialFilterExpression would express that
+ * more precisely, but Mongo's does not accept $in.)
+ *
+ * It doubles as the index every availability query needs.
+ */
+jobSchema.index({ technician: 1, slotStart: 1, status: 1 }, { unique: true });
 
 const emergencyAlertSchema = new Schema(
   {
