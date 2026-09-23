@@ -117,21 +117,28 @@ expensive. Confirmed by accident: the caller hung up and redialled without
 restarting the server, so the pooled connections survived, and that call's first
 turn was **1896ms instead of 5198ms**.
 
-Fixed by handshaking with both vendors when the call connects, while the caller is
-still saying hello. `warm()` on the LLM and TTS interfaces, measured over fresh
-processes:
+We handshake with both vendors as early as possible -- at the TwiML webhook for a
+phone call, at page load for the browser -- via `warm()` on the LLM and TTS
+interfaces.
+
+**But be careful what you claim for it.** A first pass with three samples per
+condition looked like it halved time-to-first-token. Five samples says otherwise:
 
 ```
-COLD   llm-ttft=2802ms  tts-ttfb=2005ms
-COLD   llm-ttft=1387ms  tts-ttfb=294ms
-COLD   llm-ttft=1404ms  tts-ttfb=278ms
-WARM   llm-ttft=659ms   tts-ttfb=286ms   (warm-up itself 1229ms)
-WARM   llm-ttft=713ms   tts-ttfb=275ms   (warm-up itself 420ms)
-WARM   llm-ttft=675ms   tts-ttfb=282ms   (warm-up itself 974ms)
+COLD  llm-ttft:  642  671  679  879  1532     median 679   max 1532
+WARM  llm-ttft:  672  755  776  821   880     median 776   max  880
 ```
 
-**LLM time-to-first-token halves, ~1400ms -> ~680ms.** TTS barely moves once the OS
-has cached DNS, but the genuinely-cold first run paid 2005ms there too.
+The medians are indistinguishable. The earlier "1400ms -> 680ms" reading came from
+a three-sample comparison in which one COLD run (2802ms) was the first request of
+the process and paid a cold DNS lookup on top of TLS. **The India->OpenAI hop has
+~900ms of inherent run-to-run variance, which is larger than the effect being
+measured** -- so any claim from a handful of samples is noise.
+
+What warming genuinely does is **cut the tail**: cold spread 890ms, warm spread
+208ms. p95 improves substantially, p50 does not move. Worth keeping, because p95 is
+what a caller notices and the cost is one HEAD request -- but "reduces variance",
+not "halves latency".
 
 Two details worth keeping:
 
@@ -139,11 +146,17 @@ Two details worth keeping:
   response is irrelevant** -- a 401 pools the connection exactly as well as a 200. So
   it is a HEAD request, costs no tokens and no TTS characters, and our TTS-scoped key
   401ing is fine.
-- It takes 420-1229ms, which is free only because it overlaps the caller's greeting.
-  It must never be awaited before serving audio, and must never throw: a call should
-  not fail because a warm-up did.
+- It must never be awaited before serving audio and must never throw: a call should
+  not fail, or wait, because a warm-up did.
 
-Live, first turn after the fix: **1356ms**, down from 5198ms.
+**A separate first-turn cost that warming cannot touch:** the ASR hop reads ~650ms on
+turn one against ~250ms afterwards. That is the Deepgram WebSocket still settling. The
+ASR is inherently per-call -- it needs that call's audio -- so there is no equivalent
+trick, and this is unaddressed.
+
+**Methodology note, since this cost us a wrong conclusion:** when the effect you are
+measuring is smaller than the noise, three samples will confidently tell you
+whatever you hoped. Report medians and spreads, or do not report.
 
 ### 4. A free ElevenLabs account cannot use Voice Library voices via the API
 

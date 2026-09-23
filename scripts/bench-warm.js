@@ -3,6 +3,11 @@
  *
  *   for i in 1 2 3; do node scripts/bench-warm.js; done
  *   for i in 1 2 3; do WARM=1 node scripts/bench-warm.js; done
+ *   for g in 0 2000 5000; do WARM=1 GAP=$g node scripts/bench-warm.js; done
+ *
+ * GAP waits that long AFTER warming before making the real call. That matters:
+ * a pooled connection does not live forever, so warming "as early as possible"
+ * can be worse than not warming at all.
  *
  * Must be a fresh process each run, or the previous run's pooled connection
  * makes every measurement look warm.
@@ -14,6 +19,7 @@ import { ElevenLabsTTS } from '../src/tts/elevenlabs.js';
 import { DISPATCHER_PROMPT } from '../src/prompts/dispatcher.js';
 
 const WARM = process.env.WARM === '1';
+const GAP = Number(process.env.GAP || 0);
 const llm = new OpenAILLM({ apiKey: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL || 'gpt-4o-mini' });
 const tts = new ElevenLabsTTS({ apiKey: process.env.ELEVENLABS_API_KEY, voiceId: process.env.ELEVENLABS_VOICE_ID });
 
@@ -23,6 +29,8 @@ if (WARM) {
   await Promise.all([llm.warm(), tts.warm()]);
   warmMs = performance.now() - w0;
 }
+
+if (GAP) await new Promise((r) => setTimeout(r, GAP));
 
 const messages = [
   { role: 'system', content: DISPATCHER_PROMPT },
@@ -42,6 +50,6 @@ for await (const _ of tts.speak('ok', {})) {
 }
 
 console.log(
-  `${WARM ? 'WARM  ' : 'COLD  '} llm-ttft=${llmTtft.toFixed(0)}ms  tts-ttfb=${ttsTtfb.toFixed(0)}ms` +
+  `${WARM ? 'WARM' : 'COLD'} gap=${String(GAP).padStart(4)}ms  llm-ttft=${llmTtft.toFixed(0)}ms  tts-ttfb=${ttsTtfb.toFixed(0)}ms` +
   `  total=${(llmTtft + ttsTtfb).toFixed(0)}ms${WARM ? `   (warm-up itself took ${warmMs.toFixed(0)}ms)` : ''}`
 );

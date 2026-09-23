@@ -39,6 +39,10 @@
 <script type="module">
 import { lowpassTaps } from './dsp.js';
 
+// Open the vendor connections now, while the page is still idle. By the time
+// anyone clicks Start mic and speaks, the TLS handshakes are long done.
+fetch('/warm', { method: 'POST' }).catch(() => {});
+
 const $ = (id) => document.getElementById(id);
 const log = (m) => {
   $('log').textContent += `${new Date().toISOString().slice(11, 23)}  ${m}\n`;

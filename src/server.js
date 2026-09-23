@@ -25,6 +25,44 @@ const HVAC_TERMS = [
   'sump pump', 'garbage disposal', 'burst pipe', 'no hot water',
 ];
 
+// One instance each, for the life of the process. They hold configuration, not
+// per-call state, and building them per call meant the connection warming could
+// not start until a call already existed.
+const llm = new OpenAILLM({
+  apiKey: process.env.OPENAI_API_KEY,
+  model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+});
+const tts = new ElevenLabsTTS({
+  apiKey: process.env.ELEVENLABS_API_KEY,
+  voiceId: process.env.ELEVENLABS_VOICE_ID,
+  model: process.env.ELEVENLABS_MODEL,
+});
+
+/**
+ * Open the vendor connections before the call needs them.
+ *
+ * Called as early as we possibly can: at the TwiML webhook for a phone call,
+ * and at page load for the browser. Warming when the media WebSocket opens was
+ * too late -- a caller who greets immediately (measured: speech at 1024ms)
+ * leaves nothing to hide a 400-1200ms handshake behind, and that first turn's
+ * LLM hop stayed at 1958ms against ~650ms steady state.
+ *
+ * Deliberately fire-and-forget, and rate-limited: undici keeps pooled
+ * connections alive for a while, so re-warming inside that window is wasted
+ * work.
+ */
+const WARM_EVERY_MS = 60_000;
+let lastWarm = 0;
+function warmVendors(reason) {
+  if (!process.env.OPENAI_API_KEY || !process.env.ELEVENLABS_API_KEY) return;
+  const now = Date.now();
+  if (now - lastWarm < WARM_EVERY_MS) return;
+  lastWarm = now;
+  Promise.all([llm.warm(), tts.warm()])
+    .then(() => console.log(`[warm] llm + tts connections warmed (${reason})`))
+    .catch(() => {});
+}
+
 const createAsr = ({ sampleRate }) => new DeepgramASR({
   apiKey: process.env.DEEPGRAM_API_KEY,
   model: process.env.DEEPGRAM_MODEL || 'nova-3',
@@ -62,20 +100,7 @@ function attachPipeline(transport, label) {
     return;
   }
 
-  attachConverse(transport, {
-    createAsr,
-    llm: new OpenAILLM({
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    }),
-    tts: new ElevenLabsTTS({
-      apiKey: process.env.ELEVENLABS_API_KEY,
-      voiceId: process.env.ELEVENLABS_VOICE_ID,
-      model: process.env.ELEVENLABS_MODEL,
-    }),
-    systemPrompt: DISPATCHER_PROMPT,
-    label,
-  });
+  attachConverse(transport, { createAsr, llm, tts, systemPrompt: DISPATCHER_PROMPT, label });
 }
 
 const app = express();
@@ -85,6 +110,13 @@ app.use(express.urlencoded({ extended: false }));
 
 // The browser dev client.
 app.use(express.static('public'));
+
+// The page calls this on load -- long before the mic starts, let alone before
+// anyone speaks. The best cover we get.
+app.post('/warm', (req, res) => {
+  warmVendors('browser page load');
+  res.status(204).end();
+});
 
 /**
  * Where Twilio should open the media-stream WebSocket.
@@ -114,6 +146,10 @@ function mediaStreamUrl(req) {
 app.all('/voice', (req, res) => {
   const url = mediaStreamUrl(req);
   console.log(`[voice] ${req.method} incoming call from=${req.body?.From} -> ${url}`);
+
+  // Twilio opens the media WebSocket a moment after reading this TwiML, so the
+  // handshakes overlap the connect and the caller's first breath.
+  warmVendors('twiml webhook');
 
   res.type('text/xml').send(
     `<?xml version="1.0" encoding="UTF-8"?>
