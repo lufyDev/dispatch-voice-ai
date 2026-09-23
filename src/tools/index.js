@@ -32,7 +32,10 @@ export async function runTool(name, args, context) {
   try {
     return await tool.execute(args ?? {}, context ?? {});
   } catch (err) {
-    console.error(`[tool] ${name} threw: ${err.message}`);
+    // The model gets a sanitised instruction; the log gets the truth. Without
+    // the stack here, a Mongoose buffering timeout looked like "a system
+    // problem" and took a while to trace back to a missing connectDb().
+    console.error(`[tool] ${name} threw: ${err.name}: ${err.message}`);
     return {
       ok: false,
       error: 'That did not work because of a system problem. Apologise and offer to pass the caller to a human.',

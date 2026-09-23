@@ -9,9 +9,24 @@
  */
 export class LLM {
   /**
-   * @param {Array<{role: 'system'|'user'|'assistant', content: string}>} messages
-   * @param {{ signal?: AbortSignal }} opts
-   * @returns {AsyncIterable<string>} text deltas
+   * Stream a reply.
+   *
+   * Yields TYPED EVENTS, not strings, because with tools available the model can
+   * produce two entirely different kinds of output in one turn:
+   *
+   *   { type: 'text', text }                  words to speak
+   *   { type: 'tool_call', id, name, args }   run this and tell me the answer
+   *
+   * A turn can contain both: "Let me check that for you." followed by a request
+   * for check_availability.
+   *
+   * `args` is the PARSED arguments object, or null if the model emitted
+   * malformed JSON -- which happens, and is recoverable by handing the parse
+   * failure back to it as a tool result. `raw` is kept for that message.
+   *
+   * @param {Array<object>} messages  conversation, in the vendor's message shape
+   * @param {{ signal?: AbortSignal, tools?: Array<object> }} opts
+   * @returns {AsyncIterable<object>}
    */
   async *stream(_messages, _opts) {
     throw new Error('not implemented');

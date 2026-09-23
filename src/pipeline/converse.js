@@ -1,6 +1,31 @@
 import { performance } from 'node:perf_hooks';
 import { createVad } from '../vad/index.js';
 import { looksComplete } from '../turn/completeness.js';
+import { toolSchemas, runTool } from '../tools/index.js';
+
+// A turn that calls a tool costs TWO round trips to the LLM plus the tool
+// itself, and the caller hears nothing for all of it because the agent
+// genuinely does not know the answer yet. This does not make anything faster;
+// it makes the silence explainable.
+const FILLER = 'Let me check that for you.';
+
+// A model that keeps asking for tools would keep the caller waiting forever.
+const MAX_ROUNDS = 4;
+
+/**
+ * Text that PROMISES an action without taking it.
+ *
+ * gpt-4o-mini does this reliably: "I will now check availability. Please hold."
+ * and then finishes the turn having called nothing, leaving the caller waiting
+ * for an answer that will never come. Prompt wording did not stop it -- the
+ * instruction "call the tool, do not announce it" was ignored.
+ *
+ * So we detect it instead. Its own sentence is in the history by then, and given
+ * another round it follows through. The announcement conveniently doubles as the
+ * filler: the caller is already hearing "let me check", which pays for the extra
+ * round trip.
+ */
+const PROMISES_ACTION = /\b(let me|i'?ll|i will|one moment|please hold|hold on|bear with|checking|i'?m going to)\b/i;
 
 /**
  * M3: the first real conversation. Transport -> ASR -> LLM -> TTS -> Transport.
@@ -59,6 +84,38 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   let turnAbort = null;
   const bargeIns = [];
   let rate = 8000;
+  // Set on 'start'. The model never sees it, which is what makes the derived
+  // idempotency keys in book_job trustworthy.
+  let callId = null;
+
+  /**
+   * Make the history legal for the next request.
+   *
+   * OpenAI rejects a conversation in which an assistant message carries
+   * tool_calls that are not each answered by a tool message. A barge-in can
+   * land exactly there -- we have recorded the model's request and aborted
+   * before running it -- and the resulting 400 would kill the NEXT turn, so the
+   * damage shows up nowhere near its cause.
+   */
+  function repairHistory() {
+    for (;;) {
+      let at = -1;
+      for (let i = history.length - 1; i >= 0; i -= 1) {
+        if (history[i].role === 'assistant' && history[i].tool_calls) { at = i; break; }
+      }
+      if (at === -1) return;
+
+      const wanted = history[at].tool_calls.map((c) => c.id);
+      const answered = new Set(
+        history.slice(at + 1).filter((m) => m.role === 'tool').map((m) => m.tool_call_id)
+      );
+      if (wanted.every((id) => answered.has(id))) return;
+
+      // Drop the unanswered request and everything after it.
+      history.splice(at);
+      console.log(`[${label}] dropped an unanswered tool request from history`);
+    }
+  }
 
   // BACKCHANNELS. "mhm", "yeah", "okay", "right" are the listener saying "I am
   // still here, keep going" -- not an interruption. An agent that stops dead for
@@ -214,6 +271,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       console.log(`[${label}] AGENT (heard only): "${heard}"`);
     }
     resetPlayback();
+    repairHistory();
 
     const took = performance.now() - t0;
     bargeIns.push(took);
@@ -273,29 +331,98 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       }
     }
 
-    let buffer = '';
+    const pushSentence = (text) => {
+      if (!text) return;
+      if (t.firstSentence === undefined) t.firstSentence = performance.now();
+      sentences.push(text);
+      worker ??= drain();   // start speaking before the LLM has finished
+    };
+
+    // THE AGENTIC LOOP. A turn is no longer one LLM call: the model may ask for
+    // a tool, we run it, and it speaks using the answer -- a SECOND trip to
+    // OpenAI. At the 700-1400ms we measured for that hop, a tool-using turn
+    // spends the whole latency budget twice.
     let reply = '';
+    let rounds = 0;
+    let followedUp = false;
 
-    for await (const delta of llm.stream(history, { signal: ac.signal })) {
-      if (t.llmFirstToken === undefined) t.llmFirstToken = performance.now();
-      buffer += delta;
-      reply += delta;
+    while (rounds < MAX_ROUNDS) {
+      rounds += 1;
+      let buffer = '';
+      let roundText = '';
+      const calls = [];
 
-      let piece;
-      while ((piece = takeSentence(buffer)) !== null) {
-        const [sentence, rest] = piece;
-        buffer = rest;
-        if (!sentence) continue;
-        if (t.firstSentence === undefined) t.firstSentence = performance.now();
-        sentences.push(sentence);
-        worker ??= drain();   // start speaking before the LLM has finished
+      for await (const ev of llm.stream(history, { signal: ac.signal, tools: toolSchemas() })) {
+        // First event of ANY kind, including a tool call. Timing only the first
+        // TEXT event reported the model as responding at 3157ms on a turn where
+        // it had actually answered at ~1500ms with a tool call -- and printed a
+        // trace where the LLM replied after the audio went out.
+        if (t.llmFirstToken === undefined) t.llmFirstToken = performance.now();
+        if (ev.type === 'tool_call') { calls.push(ev); continue; }
+        buffer += ev.text;
+        roundText += ev.text;
+        reply += ev.text;
+
+        let piece;
+        while ((piece = takeSentence(buffer)) !== null) {
+          const [sentence, rest] = piece;
+          buffer = rest;
+          pushSentence(sentence);
+        }
       }
+      if (buffer.trim()) pushSentence(buffer.trim());
+      if (ac.signal.aborted) return;
+
+      if (calls.length === 0) {
+        if (roundText.trim()) history.push({ role: 'assistant', content: roundText.trim() });
+
+        // Announced an action but took none. Give it exactly one more round --
+        // repeatedly would be a loop, and a caller listening to an agent
+        // announce the same check three times is worse than a wrong answer.
+        if (!followedUp && rounds < MAX_ROUNDS && PROMISES_ACTION.test(roundText)) {
+          followedUp = true;
+          console.log(`[${label}] promised an action without calling a tool — one more round`);
+          continue;
+        }
+        break;
+      }
+
+      // The request must be in the history before its results, and every call
+      // must be answered, or the next request is rejected.
+      history.push({
+        role: 'assistant',
+        content: roundText.trim() || null,
+        tool_calls: calls.map((c) => ({
+          id: c.id,
+          type: 'function',
+          function: { name: c.name, arguments: c.raw ?? '{}' },
+        })),
+      });
+
+      // Went straight for a tool without saying anything: the caller is about
+      // to sit through a database call plus another trip to OpenAI in silence.
+      if (!roundText.trim() && t.firstAudioOut === undefined) {
+        console.log(`[${label}] (filler: "${FILLER}")`);
+        pushSentence(FILLER);
+      }
+
+      for (const call of calls) {
+        const started = performance.now();
+        const result = call.args === null
+          ? { ok: false, error: 'Your arguments were not valid JSON. Call the tool again with valid JSON.' }
+          : await runTool(call.name, call.args, { callId });
+        t.toolMs = (t.toolMs ?? 0) + (performance.now() - started);
+        t.tools = [...(t.tools ?? []), call.name];
+        console.log(`[${label}] TOOL ${call.name}(${JSON.stringify(call.args)}) -> ${JSON.stringify(result).slice(0, 180)}`);
+        history.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
+      }
+      // Round again, so the model can speak using what it just learned.
     }
 
-    if (buffer.trim()) {
-      sentences.push(buffer.trim());
-      worker ??= drain();
+    if (rounds >= MAX_ROUNDS) {
+      console.log(`[${label}] hit MAX_ROUNDS=${MAX_ROUNDS}, stopping the tool loop`);
     }
+
     queueDone = true;
     await worker;
 
@@ -319,7 +446,6 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
       speaking = false;
     }
 
-    history.push({ role: 'assistant', content: reply.trim() });
     console.log(`[${label}] AGENT: "${reply.trim()}"`);
 
     // The waterfall. Every number is milliseconds after the caller stopped talking.
@@ -327,13 +453,15 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     console.log(
       `[${label}] TRACE (from caller's last word)  asr-turn-signal=${d(t.asrSignal)}` +
       `  llm-first-token=${d(t.llmFirstToken)}  first-sentence=${d(t.firstSentence)}` +
-      `  tts-first-byte=${d(t.ttsFirstByte)}  AUDIO OUT=${d(t.firstAudioOut)}`
+      `  tts-first-byte=${d(t.ttsFirstByte)}  AUDIO OUT=${d(t.firstAudioOut)}` +
+      (t.tools ? `  | ${rounds} llm rounds, tools=${t.tools.join('+')} (${t.toolMs.toFixed(0)}ms)` : '')
     );
     if (t.firstAudioOut !== undefined) turnLags.push(t.firstAudioOut - t.turnEnd);
   }
 
-  transport.on('start', ({ callId, sampleRate }) => {
-    console.log(`[${label}] start callId=${callId} sampleRate=${sampleRate}`);
+  transport.on('start', ({ callId: id, sampleRate }) => {
+    callId = id;
+    console.log(`[${label}] start callId=${id} sampleRate=${sampleRate}`);
     rate = sampleRate;
     asr = createAsr({ sampleRate });
 

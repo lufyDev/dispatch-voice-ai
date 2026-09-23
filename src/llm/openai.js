@@ -39,7 +39,7 @@ export class OpenAILLM extends LLM {
     }
   }
 
-  async *stream(messages, { signal } = {}) {
+  async *stream(messages, { signal, tools } = {}) {
     const res = await fetch(ENDPOINT, {
       method: 'POST',
       headers: {
@@ -52,6 +52,7 @@ export class OpenAILLM extends LLM {
         stream: true,
         temperature: 0.3, // a dispatcher should be boring and consistent
         max_tokens: this.#maxTokens,
+        ...(tools?.length ? { tools, tool_choice: 'auto' } : {}),
       }),
       signal,
     });
@@ -65,6 +66,27 @@ export class OpenAILLM extends LLM {
     const decoder = new TextDecoder();
     let buffer = '';
 
+    // Tool calls arrive in FRAGMENTS: the name in one frame, the arguments JSON
+    // a few characters at a time across many more, with no guarantee about
+    // where the splits land. So we accumulate by index and emit only once the
+    // stream ends -- there is no point at which a partial argument string is
+    // safe to parse.
+    const partial = new Map();
+
+    const drainToolCalls = function* () {
+      for (const call of partial.values()) {
+        let args = null;
+        try {
+          args = JSON.parse(call.args || '{}');
+        } catch {
+          // Left null on purpose. The caller turns this into a tool result
+          // telling the model its JSON was malformed, which it can retry --
+          // far better than throwing and losing the turn.
+        }
+        yield { type: 'tool_call', id: call.id, name: call.name, args, raw: call.args };
+      }
+    };
+
     for await (const chunk of res.body) {
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split('\n');
@@ -73,11 +95,27 @@ export class OpenAILLM extends LLM {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6).trim();
-        if (data === '[DONE]') return;
+        if (data === '[DONE]') {
+          yield* drainToolCalls();
+          return;
+        }
 
-        const delta = JSON.parse(data).choices?.[0]?.delta?.content;
-        if (delta) yield delta;
+        const delta = JSON.parse(data).choices?.[0]?.delta;
+        if (!delta) continue;
+
+        if (delta.content) yield { type: 'text', text: delta.content };
+
+        for (const tc of delta.tool_calls ?? []) {
+          const cur = partial.get(tc.index) ?? { id: '', name: '', args: '' };
+          if (tc.id) cur.id = tc.id;
+          if (tc.function?.name) cur.name += tc.function.name;
+          if (tc.function?.arguments) cur.args += tc.function.arguments;
+          partial.set(tc.index, cur);
+        }
       }
     }
+
+    // Some responses end without an explicit [DONE].
+    yield* drainToolCalls();
   }
 }

@@ -12,6 +12,7 @@ import { DeepgramASR } from './asr/deepgram.js';
 import { OpenAILLM } from './llm/openai.js';
 import { ElevenLabsTTS } from './tts/elevenlabs.js';
 import { DISPATCHER_PROMPT } from './prompts/dispatcher.js';
+import { connectDb } from './db/connect.js';
 
 const PORT = process.env.PORT || 3000;
 const PIPELINE = process.env.PIPELINE || 'converse'; // 'echo' | 'transcribe' | 'converse'
@@ -201,6 +202,19 @@ twilioWss.on('connection', (socket) => {
 browserWss.on('connection', (socket) => {
   attachPipeline(new BrowserTransport(socket), 'browser');
 });
+
+// Connect BEFORE accepting calls. Without this the tools still "work": Mongoose
+// buffers each query for its default 10 seconds and then throws, so a tool call
+// looks like a mysterious 10-second stall followed by a generic failure, with
+// nothing in the logs pointing at the database. Measured exactly that.
+if (PIPELINE === 'converse') {
+  try {
+    const conn = await connectDb();
+    console.log(`[boot] mongo connected: ${conn.name} on ${conn.host}:${conn.port}`);
+  } catch (err) {
+    console.error(`[boot] mongo unavailable (${err.message}) — booking tools will fail`);
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`[boot] http://localhost:${PORT}  pipeline=${PIPELINE}`);
