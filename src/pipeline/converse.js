@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { createVad } from '../vad/index.js';
 import { looksComplete } from '../turn/completeness.js';
 import { toolSchemas, runTool } from '../tools/index.js';
+import { classifyConfirmation } from '../turn/confirmation.js';
 
 // A turn that calls a tool costs TWO round trips to the LLM plus the tool
 // itself, and the caller hears nothing for all of it because the agent
@@ -87,6 +88,16 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
   // Set on 'start'. The model never sees it, which is what makes the derived
   // idempotency keys in book_job trustworthy.
   let callId = null;
+
+  /**
+   * Per-call state the TOOLS can read but the model cannot see or forge.
+   *
+   * This is where consent lives. propose_booking writes a proposal here;
+   * book_job refuses unless `confirmed` is true; and only the code below can set
+   * it, by classifying what the caller actually said. The model has no way to
+   * assert that the caller agreed.
+   */
+  const callState = { proposal: null, confirmed: false };
 
   /**
    * Make the history legal for the next request.
@@ -285,6 +296,24 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
     // Measuring from the ASR signal would hide ~335ms of endpointing wait and
     // make every later number look better than the caller's experience.
     const t = { turnEnd: lastWordWall, asrSignal: performance.now() };
+
+    // Consent is decided HERE, before the model gets a say. While a proposal is
+    // outstanding, this turn is the answer to "is that all correct?" -- and the
+    // model is not allowed to decide what the answer was.
+    if (callState.proposal && !callState.confirmed) {
+      const verdict = classifyConfirmation(userText);
+      if (verdict === 'yes') {
+        callState.confirmed = true;
+        console.log(`[${label}] caller CONFIRMED the read-back`);
+      } else if (verdict === 'no') {
+        // Cleared rather than just left unconfirmed, so the model has to call
+        // propose_booking again and read the corrected details back.
+        callState.proposal = null;
+        console.log(`[${label}] caller did NOT confirm — proposal discarded`);
+      }
+      // 'unclear' leaves it outstanding: the model will ask again.
+    }
+
     history.push({ role: 'user', content: userText });
     console.log(`[${label}] USER: "${userText}"`);
 
@@ -410,7 +439,7 @@ export function attachConverse(transport, { createAsr, llm, tts, systemPrompt, l
         const started = performance.now();
         const result = call.args === null
           ? { ok: false, error: 'Your arguments were not valid JSON. Call the tool again with valid JSON.' }
-          : await runTool(call.name, call.args, { callId });
+          : await runTool(call.name, call.args, { callId, state: callState });
         t.toolMs = (t.toolMs ?? 0) + (performance.now() - started);
         t.tools = [...(t.tools ?? []), call.name];
         console.log(`[${label}] TOOL ${call.name}(${JSON.stringify(call.args)}) -> ${JSON.stringify(result).slice(0, 180)}`);

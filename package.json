@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "test": "node scripts/test-mulaw.js && node scripts/test-dsp.js && node scripts/test-completeness.js",
+    "test": "node scripts/test-mulaw.js && node scripts/test-dsp.js && node scripts/test-completeness.js && node scripts/test-confirmation.js",
     "fetch-model": "node scripts/fetch-model.js",
     "seed": "node scripts/seed.js",
     "test:tools": "node scripts/seed.js > /dev/null && node scripts/test-tools.js"

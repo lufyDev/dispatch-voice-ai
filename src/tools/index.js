@@ -1,9 +1,9 @@
 import { lookupCustomer } from './customers.js';
 import { checkAvailability } from './availability.js';
-import { bookJob } from './booking.js';
+import { proposeBooking, bookJob } from './booking.js';
 import { createEmergencyAlert } from './emergency.js';
 
-export const TOOLS = [lookupCustomer, checkAvailability, bookJob, createEmergencyAlert];
+export const TOOLS = [lookupCustomer, checkAvailability, proposeBooking, bookJob, createEmergencyAlert];
 
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
 
@@ -23,8 +23,9 @@ export function toolSchemas() {
  * act on. An exception here would abort the turn and leave the caller in
  * silence, which is the worst available outcome.
  *
- * `context` carries the callId, which the model never sees and cannot forge.
- * That is what makes derived idempotency keys trustworthy.
+ * `context` carries the callId and the per-call `state`, neither of which the
+ * model sees or can forge. That is what makes derived idempotency keys
+ * trustworthy, and what lets book_job refuse an unconfirmed booking.
  */
 export async function runTool(name, args, context) {
   const tool = BY_NAME.get(name);

@@ -46,8 +46,10 @@ const badCat = await runTool('check_availability', { category: 'roofing' }, { ca
 check('availability rejects an unknown category', badCat.ok === false);
 
 // ---------------------------------------------------------------- booking
+// Booking is two tools and a consent flag the model cannot set. These cases are
+// the whole reason it is shaped that way.
 const slot = avail.slots[0];
-const bookArgs = {
+const details = {
   slot_id: slot.slot_id,
   phone: '555 777 8888',
   name: 'Nadia Farrow',
@@ -56,34 +58,64 @@ const bookArgs = {
   category: 'plumbing',
 };
 
-const booked = await runTool('book_job', bookArgs, { callId: CALL_A });
-check('book_job books a slot', booked.ok && !!booked.job_id, `${booked.technician}, ${booked.spoken}`);
+// A per-call state object, exactly as the pipeline supplies one.
+const stateA = { proposal: null, confirmed: false };
+const ctxA = { callId: CALL_A, state: stateA };
 
-// THE RETRY. Same call, same arguments — a model that did not notice it already
-// succeeded. Must return the SAME job and must not create a second.
-const retry = await runTool('book_job', bookArgs, { callId: CALL_A });
-check('an identical retry returns the same job, not an error',
-  retry.ok === true && retry.already_booked === true && retry.job_id === booked.job_id);
+const straightToBook = await runTool('book_job', {}, { callId: CALL_A, state: { proposal: null, confirmed: false } });
+check('book_job refuses with nothing proposed',
+  straightToBook.ok === false && /propose_booking/.test(straightToBook.error));
+
+const proposed = await runTool('propose_booking', details, ctxA);
+check('propose_booking returns a read-back sentence', proposed.ok && /is that all correct\?$/i.test(proposed.read_back), proposed.read_back);
+
+// THE CASE THE SHAPE EXISTS FOR. The model has read the details out and is
+// trying to book before the caller answered.
+const unconfirmed = await runTool('book_job', {}, ctxA);
+check('book_job refuses before the caller confirms',
+  unconfirmed.ok === false && /has not confirmed/.test(unconfirmed.error));
+
+// The pipeline heard "yes".
+stateA.confirmed = true;
+const booked = await runTool('book_job', {}, ctxA);
+check('book_job commits once confirmed', booked.ok && !!booked.job_id, `${booked.technician}, ${booked.spoken}`);
+
+// THE RETRY. Re-propose the same thing, re-confirm, book again.
+const reProposed = await runTool('propose_booking', details, ctxA);
+check('re-proposing an already-booked slot is refused as taken',
+  reProposed.ok === false && /just been taken/.test(reProposed.error), reProposed.error);
+
+// A correction after confirming must NOT be bookable without a fresh yes.
+const stateB = { proposal: null, confirmed: false };
+const ctxB = { callId: 'test-call-D', state: stateB };
+await runTool('propose_booking', { ...details, slot_id: avail.slots[1].slot_id, phone: '555 222 4444', name: 'Tom Ash', address: '12 Vale Road' }, ctxB);
+stateB.confirmed = true;
+await runTool('propose_booking', { ...details, slot_id: avail.slots[1].slot_id, phone: '555 222 4444', name: 'Tom Ash', address: '14 Vale Road' }, ctxB);
+check('a corrected proposal is unconfirmed again', stateB.confirmed === false);
+const afterCorrection = await runTool('book_job', {}, ctxB);
+check('book_job refuses the correction until re-confirmed',
+  afterCorrection.ok === false && /has not confirmed/.test(afterCorrection.error));
+
+// THE RETRY THAT ACTUALLY HAPPENS: the model calls book_job again because it
+// never saw the first result. The proposal is already consumed.
+stateB.confirmed = true;
+const first = await runTool('book_job', {}, ctxB);
+check('the confirmed correction books', first.ok === true && !!first.job_id);
+const second = await runTool('book_job', {}, ctxB);
+check('a second book_job reports the existing job rather than starting over',
+  second.ok === true && second.already_booked === true && second.job_id === first.job_id);
 check('the retry created no second job',
-  (await Job.countDocuments({ callId: CALL_A, status: 'scheduled' })) === 1,
-  `${await Job.countDocuments({ callId: CALL_A, status: 'scheduled' })} job(s) for this call`);
-
-// THE RACE. A different caller wants the same technician at the same time.
-// idempotencyKey cannot stop this — different call, different key — so the
-// (technician, slotStart, status) index has to.
-const raced = await runTool('book_job', { ...bookArgs, phone: '555 222 3333', name: 'Tom Ash', address: '12 Vale Road' }, { callId: CALL_B });
-check('a second caller cannot take the same technician and window',
-  raced.ok === false && /just taken/.test(raced.error), raced.error);
+  (await Job.countDocuments({ callId: 'test-call-D', status: 'scheduled' })) === 1);
 
 // ---------------------------------------------------------------- bad arguments
-const badSlot = await runTool('book_job', { ...bookArgs, slot_id: 'tomorrow at 10' }, { callId: CALL_A });
-check('book_job rejects an invented slot_id', badSlot.ok === false && /check_availability/.test(badSlot.error));
+const badSlot = await runTool('propose_booking', { ...details, slot_id: 'tomorrow at 10' }, ctxA);
+check('propose_booking rejects an invented slot_id', badSlot.ok === false && /check_availability/.test(badSlot.error));
 
-const noName = await runTool('book_job', { ...bookArgs, name: '', slot_id: avail.slots[1].slot_id }, { callId: CALL_A });
-check('book_job refuses without a name', noName.ok === false && /name/.test(noName.error));
+const noName = await runTool('propose_booking', { ...details, name: '', slot_id: avail.slots[2].slot_id }, ctxA);
+check('propose_booking refuses without a name', noName.ok === false && /name/.test(noName.error));
 
-const shortPhone = await runTool('book_job', { ...bookArgs, phone: '1234', slot_id: avail.slots[1].slot_id }, { callId: CALL_A });
-check('book_job refuses a partial phone number', shortPhone.ok === false && /10-digit/.test(shortPhone.error));
+const shortPhone = await runTool('propose_booking', { ...details, phone: '1234', slot_id: avail.slots[2].slot_id }, ctxA);
+check('propose_booking refuses a partial phone number', shortPhone.ok === false && /10-digit/.test(shortPhone.error));
 
 // ---------------------------------------------------------------- emergency
 const alert = await runTool('create_emergency_alert',
